@@ -1,0 +1,103 @@
+﻿package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"strings"
+
+	"ncepupan/hdd/internal/app"
+	"ncepupan/hdd/internal/cloud/mock"
+	"ncepupan/hdd/internal/platform/windows/winfsp"
+)
+
+func main() {
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		out.Write([]byte("Usage: hddfs [command]\n\n"))
+		out.Write([]byte("Commands:\n"))
+		out.Write([]byte("  version              Print version information\n"))
+		out.Write([]byte("  mount --drive H:      Mount cloud filesystem at drive\n"))
+		out.Write([]byte("  unmount --drive H:    Unmount filesystem\n"))
+		out.Write([]byte("  help                 Print this help message\n"))
+		flag.PrintDefaults()
+	}
+
+	var drive string
+	flag.StringVar(&drive, "drive", "", "Drive letter (e.g. H:)")
+	flag.Parse()
+
+	args := flag.Args()
+	cmd := "help"
+	if len(args) > 0 {
+		cmd = args[0]
+	}
+
+	switch cmd {
+	case "version":
+		app.PrintVersion("hddfs")
+	case "mount":
+		if drive == "" {
+			fmt.Fprintln(os.Stderr, "hddfs: --drive is required")
+			os.Exit(1)
+		}
+		mountDrive(drive)
+	case "unmount":
+		if drive == "" {
+			fmt.Fprintln(os.Stderr, "hddfs: --drive is required")
+			os.Exit(1)
+		}
+		unmountDrive(drive)
+	case "help", "-h", "--help":
+		flag.Usage()
+	default:
+		fmt.Fprintf(os.Stderr, "hddfs: unknown command %q\n", cmd)
+		flag.Usage()
+		os.Exit(1)
+	}
+}
+
+func mountDrive(drive string) {
+	mockDir, err := os.MkdirTemp("", "hddfs-mock-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hddfs: create mock dir: %v\n", err)
+		os.Exit(1)
+	}
+	defer os.RemoveAll(mockDir)
+
+	prov := mock.New(mockDir)
+	prov.Mkdir(context.Background(), "/")
+	prov.Upload(context.Background(), "/README.txt",
+		strings.NewReader("Huadian Drive virtual filesystem"))
+
+	fs := winfsp.New(prov)
+	fmt.Printf("Mounting Huadian Drive at %s...\n", drive)
+	if err := fs.Mount(context.Background(), drive); err != nil {
+		fmt.Fprintf(os.Stderr, "hddfs: mount: %v\n", err)
+		os.Exit(2)
+	}
+
+	fmt.Printf("Mounted at %s (Ctrl+C to unmount)\n", drive)
+
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt)
+	<-ch
+
+	fmt.Println("\nUnmounting...")
+	if err := fs.Unmount(); err != nil {
+		fmt.Fprintf(os.Stderr, "hddfs: unmount: %v\n", err)
+		os.Exit(2)
+	}
+	fmt.Println("Unmounted.")
+}
+
+func unmountDrive(drive string) {
+	fs := winfsp.New(nil)
+	if err := fs.Unmount(); err != nil {
+		fmt.Fprintf(os.Stderr, "hddfs: unmount: %v\n", err)
+		os.Exit(2)
+	}
+	fmt.Printf("Unmounted %s\n", drive)
+}

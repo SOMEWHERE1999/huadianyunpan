@@ -1,0 +1,38 @@
+package domain
+
+import (
+	"testing"
+)
+
+func TestFileOpString(t *testing.T) {
+	tests := []struct {
+		op   FileOp
+		want string
+	}{
+		{OpCreate, "create"},
+		{OpModify, "modify"},
+		{OpDelete, "delete"},
+		{OpRename, "rename"},
+		{FileOp(99), "unknown"},
+	}
+
+	for _, tt := range tests {
+		got := tt.op.String()
+		if got != tt.want {
+			t.Errorf("FileOp(%d).String() = %q, want %q", tt.op, got, tt.want)
+		}
+	}
+}
+
+func TestSyncRootFields(t *testing.T) {
+	root := SyncRoot{
+		LocalPath:  "C:\\Users\\test\\hdd",
+		RemotePath: "/sync/test",
+	}
+	if root.LocalPath != "C:\\Users\\test\\hdd" {
+		t.Errorf("unexpected LocalPath: %s", root.LocalPath)
+	}
+	if root.RemotePath != "/sync/test" {
+		t.Errorf("unexpected RemotePath: %s", root.RemotePath)
+	}
+}

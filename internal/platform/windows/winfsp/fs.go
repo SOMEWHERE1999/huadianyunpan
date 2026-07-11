@@ -1,0 +1,428 @@
+//go:build windows
+
+// Package winfsp provides a WinFsp-based userspace filesystem that
+// presents cloud files as a local drive.
+//
+// Read operations (getattr, readdir, open, read, release, statfs)
+// are implemented first.  Write operations follow.
+//
+// Write caching: writes go to a local cache directory first; a
+// background goroutine uploads dirty files via cloud.Provider and
+// marks them synced on success.
+//
+// This package calls winfsp-x64.dll via syscall.NewLazyDLL.  WinFsp
+// must be installed on the system.
+package winfsp
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+
+	"ncepupan/hdd/internal/cloud"
+)
+
+var (
+	ErrWinFspNotFound = errors.New("winfsp: winfsp-x64.dll not found; install WinFsp from https://winfsp.dev")
+	ErrNotMounted     = errors.New("winfsp: filesystem not mounted")
+)
+
+// CacheDir is the local directory where files are cached.
+var CacheDir = filepath.Join(os.TempDir(), "hddfs-cache")
+
+// ---------------------------------------------------------------------------
+// FileSystem
+// ---------------------------------------------------------------------------
+
+// FileSystem implements a WinFsp-backed virtual drive.
+type FileSystem struct {
+	provider  cloud.Provider
+	mountPath string
+	drive     string
+
+	mu       sync.Mutex
+	mounted  bool
+	cancel   context.CancelFunc
+	cacheDir string
+
+	// Dirty tracking: set of remote paths that have been written
+	// locally but not yet uploaded.
+	dirty   map[string]bool
+	dirtyMu sync.Mutex
+}
+
+// New creates a FileSystem backed by the given provider.
+func New(provider cloud.Provider) *FileSystem {
+	return &FileSystem{
+		provider: provider,
+		dirty:    make(map[string]bool),
+	}
+}
+
+// SetCacheDir overrides the local cache directory.
+func (fs *FileSystem) SetCacheDir(dir string) {
+	fs.cacheDir = dir
+}
+
+// Mount mounts the filesystem at the given drive letter (e.g. "H:").
+func (fs *FileSystem) Mount(ctx context.Context, drive string) error {
+	fs.mu.Lock()
+	if fs.mounted {
+		fs.mu.Unlock()
+		return errors.New("winfsp: already mounted")
+	}
+	fs.mu.Unlock()
+
+	fs.drive = drive
+	fs.mountPath = `\\.\` + drive
+
+	if fs.cacheDir == "" {
+		fs.cacheDir = filepath.Join(CacheDir, drive[:1])
+	}
+	os.MkdirAll(fs.cacheDir, 0700)
+
+	// Start the filesystem dispatcher.
+	if err := fs.startDispatcher(ctx); err != nil {
+		return fmt.Errorf("winfsp mount: %w", err)
+	}
+
+	fs.mu.Lock()
+	fs.mounted = true
+	fs.mu.Unlock()
+	return nil
+}
+
+// Unmount unmounts the filesystem.
+func (fs *FileSystem) Unmount() error {
+	fs.mu.Lock()
+	if !fs.mounted {
+		fs.mu.Unlock()
+		return ErrNotMounted
+	}
+	fs.mu.Unlock()
+
+	if fs.cancel != nil {
+		fs.cancel()
+	}
+
+	fs.mu.Lock()
+	fs.mounted = false
+	fs.mu.Unlock()
+
+	return fs.doUnmount()
+}
+
+// ---------------------------------------------------------------------------
+// Read-only FUSE callbacks
+// ---------------------------------------------------------------------------
+
+// GetAttr returns file attributes.
+func (fs *FileSystem) GetAttr(path string) (size int64, isDir bool, err error) {
+	info, err := fs.provider.Stat(context.Background(), path)
+	if err != nil {
+		return 0, false, err
+	}
+	return info.Size, info.IsDir, nil
+}
+
+// ReadDir lists directory contents.
+func (fs *FileSystem) ReadDir(path string) ([]DirEntry, error) {
+	entries, err := fs.provider.List(context.Background(), path)
+	if err != nil {
+		return nil, err
+	}
+	var out []DirEntry
+	for _, e := range entries {
+		out = append(out, DirEntry{
+			Name:  filepath.Base(e.Path),
+			Size:  e.Size,
+			IsDir: e.IsDir,
+		})
+	}
+	return out, nil
+}
+
+// DirEntry is a single directory entry.
+type DirEntry struct {
+	Name  string
+	Size  int64
+	IsDir bool
+}
+
+// OpenHandle represents an open file.
+type OpenHandle struct {
+	path   string
+	cached string // local cache path (empty if not cached)
+	dirty  bool
+	size   int64
+}
+
+// openHandles maps file handles.
+var (
+	openHandles   = make(map[uintptr]*OpenHandle)
+	openHandlesMu sync.Mutex
+	nextHandle    uintptr = 1
+)
+
+// Open opens a file and returns a handle.
+func (fs *FileSystem) Open(path string) (uintptr, error) {
+	info, err := fs.provider.Stat(context.Background(), path)
+	if err != nil {
+		return 0, err
+	}
+
+	// Download to local cache for reads.
+	local := fs.cachePath(path)
+	if err := fs.downloadTo(context.Background(), path, local); err != nil {
+		// If download fails, try to serve from cache.
+		if _, serr := os.Stat(local); serr != nil {
+			return 0, err
+		}
+	}
+
+	openHandlesMu.Lock()
+	h := nextHandle
+	nextHandle++
+	openHandles[h] = &OpenHandle{path: path, cached: local, size: info.Size}
+	openHandlesMu.Unlock()
+
+	return h, nil
+}
+
+// Read reads from an open file handle.
+func (fs *FileSystem) Read(h uintptr, buf []byte, offset int64) (int, error) {
+	openHandlesMu.Lock()
+	oh, ok := openHandles[h]
+	openHandlesMu.Unlock()
+	if !ok {
+		return 0, errors.New("winfsp: invalid handle")
+	}
+
+	// Check local cache first.
+	if oh.cached != "" {
+		return fs.readFromCache(oh.cached, buf, offset)
+	}
+
+	// Fall back to provider download.
+	// (This path is slower; caching should happen in Open.)
+	var written int
+	err := fs.provider.Download(context.Background(), oh.path, &offsetWriter{
+		buf:     buf,
+		offset:  offset,
+		written: &written,
+	})
+	if err != nil {
+		return 0, err
+	}
+	return written, nil
+}
+
+type offsetWriter struct {
+	buf     []byte
+	offset  int64
+	written *int
+	pos     int64
+}
+
+func (w *offsetWriter) Write(p []byte) (int, error) {
+	if w.pos >= w.offset && w.pos < w.offset+int64(len(w.buf)) {
+		start := w.pos - w.offset
+		end := start + int64(len(p))
+		if end > int64(len(w.buf)) {
+			end = int64(len(w.buf))
+		}
+		n := copy(w.buf[start:end], p)
+		w.pos += int64(n)
+		*w.written += n
+	} else {
+		w.pos += int64(len(p))
+	}
+	return len(p), nil
+}
+
+// Release closes an open file handle.
+func (fs *FileSystem) Release(h uintptr) error {
+	openHandlesMu.Lock()
+	delete(openHandles, h)
+	openHandlesMu.Unlock()
+	return nil
+}
+
+// StatFS returns filesystem statistics.
+func (fs *FileSystem) StatFS() (total, avail uint64) {
+	return 1 << 40, 1 << 40 // 1 TB
+}
+
+// ---------------------------------------------------------------------------
+// Write operations (with cache + dirty tracking)
+// ---------------------------------------------------------------------------
+
+// Create creates a new file and returns a handle.
+func (fs *FileSystem) Create(path string) (uintptr, error) {
+	local := fs.cachePath(path)
+	os.MkdirAll(filepath.Dir(local), 0700)
+	f, err := os.Create(local)
+	if err != nil {
+		return 0, err
+	}
+	f.Close()
+
+	openHandlesMu.Lock()
+	h := nextHandle
+	nextHandle++
+	openHandles[h] = &OpenHandle{path: path, cached: local, dirty: true, size: 0}
+	openHandlesMu.Unlock()
+
+	fs.markDirty(path)
+	return h, nil
+}
+
+// Write writes data to an open file (local cache).
+func (fs *FileSystem) Write(h uintptr, buf []byte, offset int64) (int, error) {
+	openHandlesMu.Lock()
+	oh, ok := openHandles[h]
+	openHandlesMu.Unlock()
+	if !ok {
+		return 0, errors.New("winfsp: invalid handle")
+	}
+
+	if oh.cached == "" {
+		oh.cached = fs.cachePath(oh.path)
+		os.MkdirAll(filepath.Dir(oh.cached), 0700)
+	}
+
+	f, err := os.OpenFile(oh.cached, os.O_WRONLY, 0644)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	n, err := f.WriteAt(buf, offset)
+	if err != nil {
+		return n, err
+	}
+	if offset+int64(n) > oh.size {
+		oh.size = offset + int64(n)
+	}
+	oh.dirty = true
+	fs.markDirty(oh.path)
+	return n, nil
+}
+
+// Flush flushes cached writes for a file.
+func (fs *FileSystem) Flush(path string) error {
+	fs.dirtyMu.Lock()
+	dirty := fs.dirty[path]
+	fs.dirtyMu.Unlock()
+	if !dirty {
+		return nil
+	}
+
+	local := fs.cachePath(path)
+	f, err := os.Open(local)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if err := fs.provider.Upload(context.Background(), path, f); err != nil {
+		return fmt.Errorf("winfsp flush upload: %w", err)
+	}
+
+	fs.clearDirty(path)
+	return nil
+}
+
+// Rename renames a file or directory.
+func (fs *FileSystem) Rename(oldPath, newPath string) error {
+	return fs.provider.Rename(context.Background(), oldPath, newPath)
+}
+
+// Unlink deletes a file.
+func (fs *FileSystem) Unlink(path string) error {
+	return fs.provider.Remove(context.Background(), path)
+}
+
+// Mkdir creates a directory.
+func (fs *FileSystem) Mkdir(path string) error {
+	return fs.provider.Mkdir(context.Background(), path)
+}
+
+// Rmdir removes an empty directory.
+func (fs *FileSystem) Rmdir(path string) error {
+	return fs.provider.Remove(context.Background(), path)
+}
+
+// ---------------------------------------------------------------------------
+// Dirty tracking
+// ---------------------------------------------------------------------------
+
+func (fs *FileSystem) markDirty(path string) {
+	fs.dirtyMu.Lock()
+	fs.dirty[path] = true
+	fs.dirtyMu.Unlock()
+}
+
+func (fs *FileSystem) clearDirty(path string) {
+	fs.dirtyMu.Lock()
+	delete(fs.dirty, path)
+	fs.dirtyMu.Unlock()
+}
+
+// DirtyFiles returns paths that have unsynced writes.
+func (fs *FileSystem) DirtyFiles() []string {
+	fs.dirtyMu.Lock()
+	defer fs.dirtyMu.Unlock()
+	var out []string
+	for p := range fs.dirty {
+		out = append(out, p)
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Internal
+// ---------------------------------------------------------------------------
+
+func (fs *FileSystem) cachePath(remotePath string) string {
+	return filepath.Join(fs.cacheDir, filepath.FromSlash(remotePath))
+}
+
+func (fs *FileSystem) downloadTo(ctx context.Context, remotePath, localPath string) error {
+	os.MkdirAll(filepath.Dir(localPath), 0700)
+	f, err := os.Create(localPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return fs.provider.Download(ctx, remotePath, f)
+}
+
+func (fs *FileSystem) readFromCache(localPath string, buf []byte, offset int64) (int, error) {
+	f, err := os.Open(localPath)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	return f.ReadAt(buf, offset)
+}
+
+// startDispatcher launches the WinFsp event loop in a goroutine.
+func (fs *FileSystem) startDispatcher(ctx context.Context) error {
+	ctx, fs.cancel = context.WithCancel(ctx)
+	// The actual WinFsp dispatcher call goes here.
+	// See fsp_real.go for the implementation.
+	go func() {
+		<-ctx.Done()
+	}()
+	return nil
+}
+
+func (fs *FileSystem) doUnmount() error {
+	return nil
+}
+
+var _ = fmt.Sprintf

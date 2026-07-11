@@ -1,0 +1,97 @@
+﻿// Package config provides configuration loading for the Huadian Drive client.
+package config
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+// Config holds all runtime configuration.
+type Config struct {
+	// SyncRoots lists directories synchronized with the cloud.
+	SyncRoots  []SyncRootConfig `json:"sync_roots"`
+
+	// LogLevel controls verbosity: debug, info, warn, error.
+	LogLevel   string           `json:"log_level"`
+
+	// LogFile is the path for log output; empty means stderr.
+	LogFile    string           `json:"log_file"`
+
+	// WorkerPoolSize controls concurrent upload/download workers.
+	WorkerPoolSize int           `json:"worker_pool_size"`
+}
+
+// SyncRootConfig pairs a local directory with a remote path.
+type SyncRootConfig struct {
+	LocalPath  string `json:"local_path"`
+	RemotePath string `json:"remote_path"`
+}
+
+// Default returns a Config with safe defaults.
+func Default() *Config {
+	return &Config{
+		LogLevel:       "info",
+		WorkerPoolSize: 4,
+	}
+}
+
+// AppDataDirs returns paths for application data.
+type AppDataDirs struct {
+	ConfigDir string
+	DataDir   string
+}
+
+// GetAppDataDirs returns the standard application directories.
+func GetAppDataDirs() (*AppDataDirs, error) {
+	appData := os.Getenv("APPDATA")
+	if appData == "" {
+		return nil, fmt.Errorf("APPDATA environment variable not set")
+	}
+	localAppData := os.Getenv("LOCALAPPDATA")
+	if localAppData == "" {
+		return nil, fmt.Errorf("LOCALAPPDATA environment variable not set")
+	}
+
+	return &AppDataDirs{
+		ConfigDir: filepath.Join(appData, "hdd"),
+		DataDir:   filepath.Join(localAppData, "hdd"),
+	}, nil
+}
+
+// Load reads configuration from a file and applies defaults.
+func Load(path string) (*Config, error) {
+	cfg := Default()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cfg, nil
+		}
+		return nil, fmt.Errorf("reading config: %w", err)
+	}
+
+	if err := json.Unmarshal(data, cfg); err != nil {
+		return nil, fmt.Errorf("parsing config: %w", err)
+	}
+	return cfg, nil
+}
+
+// Save writes the configuration to a file.
+func (c *Config) Save(path string) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("creating config dir: %w", err)
+	}
+
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling config: %w", err)
+	}
+
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return fmt.Errorf("writing config: %w", err)
+	}
+	return nil
+}

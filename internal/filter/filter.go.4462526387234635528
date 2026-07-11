@@ -1,0 +1,85 @@
+﻿package filter
+
+import (
+	"io/fs"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+type RuleType int
+
+const (
+	RuleName RuleType = iota
+	RulePath
+	RuleSize
+)
+
+type Rule struct {
+	Type    RuleType
+	Pattern string
+	MaxSize int64
+}
+
+type Filter struct {
+	rules []Rule
+}
+
+func New(rules []Rule) *Filter {
+	return &Filter{rules: rules}
+}
+
+func DefaultExcludes() []Rule {
+	return []Rule{
+		{Type: RuleName, Pattern: "*.tmp"},
+		{Type: RuleName, Pattern: "*.log"},
+		{Type: RuleName, Pattern: "~$*"},
+		{Type: RulePath, Pattern: ".git"},
+		{Type: RulePath, Pattern: "node_modules"},
+		{Type: RuleSize, MaxSize: 500 * 1024 * 1024},
+	}
+}
+
+func (f *Filter) Exclude(path string, info fs.FileInfo) bool {
+	base := filepath.Base(path)
+	for _, r := range f.rules {
+		switch r.Type {
+		case RuleName:
+			if match, _ := filepath.Match(r.Pattern, base); match {
+				return true
+			}
+		case RulePath:
+			if hasPathComponent(path, r.Pattern) {
+				return true
+			}
+		case RuleSize:
+			if r.MaxSize > 0 && info.Size() > r.MaxSize {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (f *Filter) ExcludePath(path string) bool {
+	return f.Exclude(path, nilFileInfo{})
+}
+
+type nilFileInfo struct{}
+
+func (nilFileInfo) Name() string       { return "" }
+func (nilFileInfo) Size() int64        { return 0 }
+func (nilFileInfo) Mode() fs.FileMode  { return 0 }
+func (nilFileInfo) ModTime() time.Time { return time.Time{} }
+func (nilFileInfo) IsDir() bool        { return false }
+func (nilFileInfo) Sys() any           { return nil }
+
+func hasPathComponent(path, name string) bool {
+	path = filepath.ToSlash(path)
+	for _, p := range strings.Split(path, "/") {
+		if p == name {
+			return true
+		}
+	}
+	return false
+}

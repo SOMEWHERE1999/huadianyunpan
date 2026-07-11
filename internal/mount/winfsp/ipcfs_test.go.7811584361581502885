@@ -1,0 +1,653 @@
+//go:build windows && cgo
+
+package winfsp
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"ncepupan/hdd/internal/cloud/mock"
+	"ncepupan/hdd/internal/ipc"
+
+	"github.com/winfsp/cgofuse/fuse"
+)
+
+// ---------------------------------------------------------------------------
+// validateCachePath tests
+// ---------------------------------------------------------------------------
+
+func TestValidateCachePath_Valid(t *testing.T) {
+	dir := t.TempDir()
+	fpath := filepath.Join(dir, "hello.txt")
+	os.WriteFile(fpath, []byte("hello"), 0644)
+
+	if err := validateCachePath(fpath, dir); err != nil {
+		t.Errorf("valid path should pass: %v", err)
+	}
+}
+
+func TestValidateCachePath_OutsideDir(t *testing.T) {
+	dir := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	os.WriteFile(outside, []byte("hello"), 0644)
+
+	if err := validateCachePath(outside, dir); err == nil {
+		t.Error("path outside cache dir should fail")
+	}
+}
+
+func TestValidateCachePath_Traversal(t *testing.T) {
+	dir := t.TempDir()
+	traversal, _ := filepath.Abs(filepath.Join(dir, "..", "outside.txt"))
+
+	err := validateCachePath(traversal, dir)
+	if err == nil {
+		t.Error("path with .. traversal should fail")
+	}
+}
+
+func TestValidateCachePath_NotRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	subdir := filepath.Join(dir, "subdir")
+	os.Mkdir(subdir, 0700)
+
+	if err := validateCachePath(subdir, dir); err == nil {
+		t.Error("directory should not pass as regular file")
+	}
+}
+
+func TestValidateCachePath_NotFound(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := validateCachePath(filepath.Join(dir, "nonexistent"), dir); err == nil {
+		t.Error("nonexistent file should fail")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ipcErrToFuse tests
+// ---------------------------------------------------------------------------
+
+func TestIPCErrToFuse_Nil(t *testing.T) {
+	if ipcErrToFuse(nil) != 0 {
+		t.Error("nil error should return 0")
+	}
+}
+
+func TestIPCErrToFuse_NotFound(t *testing.T) {
+	err := ipcErrToFuse(os.ErrNotExist)
+	if err != -2 { // -ENOENT
+		t.Errorf("os.ErrNotExist should map to -ENOENT, got %d", err)
+	}
+}
+
+func TestIPCErrToFuse_IsDir(t *testing.T) {
+	err := ipcErrToFuse(&testError{msg: "is a directory"})
+	if err != -21 { // -EISDIR
+		t.Errorf("'is a directory' should map to -EISDIR, got %d", err)
+	}
+}
+
+type testError struct{ msg string }
+
+func (e *testError) Error() string { return e.msg }
+
+func TestProjectMode(t *testing.T) {
+	tests := []struct {
+		name      string
+		readOnly  bool
+		mkdirOnly bool
+		input     uint32
+		want      uint32
+	}{
+		{"read-only directory", true, false, fuse.S_IFDIR | 0777, fuse.S_IFDIR | 0555},
+		{"read-only file", true, false, fuse.S_IFREG | 0666, fuse.S_IFREG | 0444},
+		{"mkdir-only directory", false, true, fuse.S_IFDIR | 0555, fuse.S_IFDIR | 0777},
+		{"mkdir-only file", false, true, fuse.S_IFREG | 0666, fuse.S_IFREG | 0444},
+		{"writable directory", false, false, fuse.S_IFDIR | 0555, fuse.S_IFDIR | 0755},
+		{"writable file", false, false, fuse.S_IFREG | 0444, fuse.S_IFREG | 0644},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := &IPCFileSystem{readOnly: tt.readOnly, mkdirOnly: tt.mkdirOnly}
+			stat := fuse.Stat_t{Mode: tt.input}
+			fs.projectMode(&stat)
+			if stat.Mode != tt.want {
+				t.Fatalf("mode=%#o, want %#o", stat.Mode, tt.want)
+			}
+		})
+	}
+}
+
+func TestAccessPolicyForRoot(t *testing.T) {
+	tests := []struct {
+		name      string
+		readOnly  bool
+		mkdirOnly bool
+		mask      uint32
+		want      int
+	}{
+		{"mkdir-only read", false, true, fuse.R_OK, 0},
+		{"mkdir-only traverse", false, true, fuse.X_OK, 0},
+		{"mkdir-only directory write", false, true, fuse.W_OK, 0},
+		{"mkdir-only delete", false, true, fuse.DELETE_OK, -fuse.EPERM},
+		{"read-only write", true, false, fuse.W_OK, -fuse.EROFS},
+		{"writable directory write", false, false, fuse.W_OK, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := &IPCFileSystem{readOnly: tt.readOnly, mkdirOnly: tt.mkdirOnly}
+			if got := fs.Access("/", tt.mask); got != tt.want {
+				t.Fatalf("Access=%d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMkdirOnlyMutationsRemainBlocked(t *testing.T) {
+	fs := &IPCFileSystem{mkdirOnly: true}
+	if rc, _ := fs.Create("/blocked.txt", fuse.O_CREAT|fuse.O_WRONLY, 0666); rc != -fuse.EROFS {
+		t.Fatalf("Create=%d, want %d", rc, -fuse.EROFS)
+	}
+	if rc := fs.Write("/blocked.txt", []byte("x"), 0, 0); rc != -fuse.EROFS {
+		t.Fatalf("Write=%d, want %d", rc, -fuse.EROFS)
+	}
+	if rc := fs.Rename("/a", "/b"); rc != -fuse.EROFS {
+		t.Fatalf("Rename=%d, want %d", rc, -fuse.EROFS)
+	}
+	if rc := fs.Unlink("/a"); rc != -fuse.EROFS {
+		t.Fatalf("Unlink=%d, want %d", rc, -fuse.EROFS)
+	}
+	if rc := fs.Rmdir("/a"); rc != -fuse.EROFS {
+		t.Fatalf("Rmdir=%d, want %d", rc, -fuse.EROFS)
+	}
+	if rc := fs.Truncate("/a", 0, 0); rc != -fuse.EROFS {
+		t.Fatalf("Truncate=%d, want %d", rc, -fuse.EROFS)
+	}
+	if rc := fs.Chmod("/a", 0600); rc != -fuse.EROFS {
+		t.Fatalf("Chmod=%d, want %d", rc, -fuse.EROFS)
+	}
+	if rc := fs.Chown("/a", 1, 1); rc != -fuse.EROFS {
+		t.Fatalf("Chown=%d, want %d", rc, -fuse.EROFS)
+	}
+	if rc := fs.Utimens("/a", nil); rc != -fuse.EROFS {
+		t.Fatalf("Utimens=%d, want %d", rc, -fuse.EROFS)
+	}
+	if rc := fs.Setxattr("/a", "x", nil, 0); rc != -fuse.EROFS {
+		t.Fatalf("Setxattr=%d, want %d", rc, -fuse.EROFS)
+	}
+	if rc := fs.Removexattr("/a", "x"); rc != -fuse.EROFS {
+		t.Fatalf("Removexattr=%d, want %d", rc, -fuse.EROFS)
+	}
+}
+
+func TestReadOnlyRmdirIsBlocked(t *testing.T) {
+	fs := &IPCFileSystem{readOnly: true}
+	if rc := fs.Rmdir("/a"); rc != -fuse.EROFS {
+		t.Fatalf("Rmdir=%d, want %d", rc, -fuse.EROFS)
+	}
+}
+
+func TestMkdirOnlyNeverCallsMockRemove(t *testing.T) {
+	root := t.TempDir()
+	provider := mock.New(root)
+	var mkdirCalls atomic.Int32
+	var removeCalls atomic.Int32
+	callFn := func(req ipc.Request) (ipc.Response, error) {
+		resp := ipc.Response{Type: req.Type, ID: req.ID}
+		switch req.Type {
+		case "fs.mkdir":
+			var payload struct {
+				Path string `json:"path"`
+			}
+			_ = json.Unmarshal(req.Data, &payload)
+			mkdirCalls.Add(1)
+			if err := provider.Mkdir(context.Background(), payload.Path); err != nil {
+				resp.Error = err.Error()
+			}
+		case "fs.remove":
+			removeCalls.Add(1)
+			var payload ipc.FSRemoveRequest
+			_ = json.Unmarshal(req.Data, &payload)
+			if err := provider.Remove(context.Background(), payload.Path); err != nil {
+				resp.Error = err.Error()
+			}
+		}
+		return resp, nil
+	}
+
+	fs := &IPCFileSystem{
+		client:    &IPCClient{},
+		ctx:       context.Background(),
+		files:     make(map[string]*ipcFileHandle),
+		dirs:      make(map[string]*cachedDir),
+		pathLocks: make(map[string]*sync.Mutex),
+		mkdirOnly: true,
+		callFn:    callFn,
+	}
+	if rc := fs.Rmdir("/kept"); rc != -fuse.EROFS {
+		t.Fatalf("Rmdir=%d, want %d", rc, -fuse.EROFS)
+	}
+	if rc := fs.Unlink("/kept"); rc != -fuse.EROFS {
+		t.Fatalf("Unlink=%d, want %d", rc, -fuse.EROFS)
+	}
+	if rc := fs.Mkdir("/allowed", 0770); rc != 0 {
+		t.Fatalf("Mkdir=%d, want 0", rc)
+	}
+	if rc, _ := fs.Create("/blocked.txt", fuse.O_CREAT|fuse.O_WRONLY, 0666); rc != -fuse.EROFS {
+		t.Fatalf("Create=%d, want %d", rc, -fuse.EROFS)
+	}
+	if got := removeCalls.Load(); got != 0 {
+		t.Fatalf("mock Remove calls=%d, want 0", got)
+	}
+	if got := mkdirCalls.Load(); got != 1 {
+		t.Fatalf("mock Mkdir calls=%d, want 1", got)
+	}
+	if _, err := os.Stat(filepath.Join(root, "allowed")); err != nil {
+		t.Fatalf("mock directory was not created: %v", err)
+	}
+}
+
+func TestReaddirIncludesDotEntriesAndIsRepeatable(t *testing.T) {
+	fs := &IPCFileSystem{
+		dirs:      map[string]*cachedDir{"/": {cachedAt: time.Now()}},
+		mkdirOnly: true,
+	}
+	for i := 0; i < 20; i++ {
+		var names []string
+		rc := fs.Readdir("/", func(name string, _ *fuse.Stat_t, _ int64) bool {
+			names = append(names, name)
+			return true
+		}, 0, 0)
+		if rc != 0 {
+			t.Fatalf("iteration %d: Readdir=%d", i, rc)
+		}
+		if len(names) != 2 || names[0] != "." || names[1] != ".." {
+			t.Fatalf("iteration %d: names=%q", i, names)
+		}
+	}
+}
+
+func TestProjectModeNewModeFileIs0444(t *testing.T) {
+	// new16 mode file should still be 0444
+	fs := &IPCFileSystem{mkdirRenameMoveFileRenameMoveOnly: true}
+	var stat fuse.Stat_t
+	stat.Mode = fuse.S_IFREG | 0644
+	fs.projectMode(&stat)
+	if stat.Mode != (fuse.S_IFREG | 0444) {
+		t.Errorf("new16 file mode = %#o, want %#o", stat.Mode, fuse.S_IFREG|0444)
+	}
+}
+
+func TestProjectModeNewRemoveModeFileIs0666(t *testing.T) {
+	// new17 delete mode file should be 0666 (world-write so Windows delete can reach Unlink)
+	fs := &IPCFileSystem{mkdirRenameMoveFileRenameMoveRemoveOnly: true}
+	var stat fuse.Stat_t
+	stat.Mode = fuse.S_IFREG | 0644
+	fs.projectMode(&stat)
+	if stat.Mode != (fuse.S_IFREG | 0666) {
+		t.Errorf("new17 delete mode file mode = %#o, want %#o", stat.Mode, fuse.S_IFREG|0666)
+	}
+}
+
+func TestProjectModeReadOnlyFileStill0444(t *testing.T) {
+	fs := &IPCFileSystem{readOnly: true}
+	var stat fuse.Stat_t
+	stat.Mode = fuse.S_IFREG | 0644
+	fs.projectMode(&stat)
+	if stat.Mode != (fuse.S_IFREG | 0444) {
+		t.Errorf("readOnly file mode = %#o, want %#o", stat.Mode, fuse.S_IFREG|0444)
+	}
+}
+
+func TestProjectModeNewModeDirIs0777(t *testing.T) {
+	fs := &IPCFileSystem{mkdirRenameMoveFileRenameMoveOnly: true}
+	var stat fuse.Stat_t
+	stat.Mode = fuse.S_IFDIR | 0555
+	fs.projectMode(&stat)
+	if stat.Mode != (fuse.S_IFDIR | 0777) {
+		t.Errorf("dir mode = %#o, want %#o", stat.Mode, fuse.S_IFDIR|0777)
+	}
+}
+
+func TestIsRestrictedMode(t *testing.T) {
+	tests := []struct {
+		name       string
+		fs         *IPCFileSystem
+		restricted bool
+	}{
+		{"fully writable", &IPCFileSystem{}, false},
+		{"read only", &IPCFileSystem{readOnly: true}, true},
+		{"mkdir only", &IPCFileSystem{mkdirOnly: true}, true},
+		{"mkdirRenameOnly", &IPCFileSystem{mkdirRenameOnly: true}, true},
+		{"mkdirRenameMoveOnly", &IPCFileSystem{mkdirRenameMoveOnly: true}, true},
+		{"mkdirRenameMoveFileRenameOnly", &IPCFileSystem{mkdirRenameMoveFileRenameOnly: true}, true},
+		{"new16 mode", &IPCFileSystem{mkdirRenameMoveFileRenameMoveOnly: true}, true},
+		{"new17 delete mode", &IPCFileSystem{mkdirRenameMoveFileRenameMoveRemoveOnly: true}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.fs.isRestrictedMode(); got != tt.restricted {
+				t.Errorf("isRestrictedMode() = %v, want %v", got, tt.restricted)
+			}
+		})
+	}
+}
+
+func TestRestrictedModeRejectsWriteOps(t *testing.T) {
+	fs := &IPCFileSystem{mkdirRenameMoveFileRenameMoveOnly: true}
+
+	if rc := fs.Write("/f", nil, 0, 0); rc != -fuse.EROFS {
+		t.Errorf("Write = %d, want %d", rc, -fuse.EROFS)
+	}
+	if rc := fs.Truncate("/f", 0, 0); rc != -fuse.EROFS {
+		t.Errorf("Truncate = %d, want %d", rc, -fuse.EROFS)
+	}
+	if rc := fs.Unlink("/f"); rc != -fuse.EROFS {
+		t.Errorf("Unlink = %d, want %d", rc, -fuse.EROFS)
+	}
+	if rc := fs.Rmdir("/d"); rc != -fuse.EROFS {
+		t.Errorf("Rmdir = %d, want %d", rc, -fuse.EROFS)
+	}
+}
+
+func TestRestrictedModeRejectsWriteOpen(t *testing.T) {
+	fs := &IPCFileSystem{mkdirRenameMoveFileRenameMoveOnly: true}
+	// O_WRONLY must be rejected.
+	rc, _ := fs.Open("/f", int(os.O_WRONLY))
+	if rc != -fuse.EROFS {
+		t.Errorf("Open(O_WRONLY) = %d, want %d", rc, -fuse.EROFS)
+	}
+	// O_RDWR must be rejected.
+	rc, _ = fs.Open("/f", int(os.O_RDWR))
+	if rc != -fuse.EROFS {
+		t.Errorf("Open(O_RDWR) = %d, want %d", rc, -fuse.EROFS)
+	}
+	// O_TRUNC must be rejected.
+	rc, _ = fs.Open("/f", int(os.O_TRUNC))
+	if rc != -fuse.EROFS {
+		t.Errorf("Open(O_TRUNC) = %d, want %d", rc, -fuse.EROFS)
+	}
+}
+
+func TestNewRemoveModeUnlinkAllowed(t *testing.T) {
+	var removeCalls int32
+	callFn := func(req ipc.Request) (ipc.Response, error) {
+		if req.Type == "fs.remove" {
+			atomic.AddInt32(&removeCalls, 1)
+		}
+		return ipc.Response{Type: req.Type, ID: req.ID}, nil
+	}
+	fs := &IPCFileSystem{
+		mkdirRenameMoveFileRenameMoveRemoveOnly: true,
+		client:    &IPCClient{},
+		ctx:       context.Background(),
+		files:     make(map[string]*ipcFileHandle),
+		dirs:      make(map[string]*cachedDir),
+		pathLocks: make(map[string]*sync.Mutex),
+		callFn:    callFn,
+	}
+
+	if rc := fs.Unlink("/f.txt"); rc != 0 {
+		t.Errorf("Unlink = %d, want 0", rc)
+	}
+	if got := removeCalls; got != 1 {
+		t.Errorf("removeCalls = %d, want 1", got)
+	}
+}
+
+func TestNew16ModeUnlinkRejected(t *testing.T) {
+	fs := &IPCFileSystem{
+		mkdirRenameMoveFileRenameMoveOnly: true,
+	}
+	if rc := fs.Unlink("/f.txt"); rc != -fuse.EROFS {
+		t.Errorf("new16 mode Unlink = %d, want %d", rc, -fuse.EROFS)
+	}
+}
+
+func TestNewRemoveModeRmdirAllowed(t *testing.T) {
+	var removeCalls int32
+	callFn := func(req ipc.Request) (ipc.Response, error) {
+		if req.Type == "fs.remove" {
+			atomic.AddInt32(&removeCalls, 1)
+		}
+		return ipc.Response{Type: req.Type, ID: req.ID}, nil
+	}
+	fs := &IPCFileSystem{
+		mkdirRenameMoveFileRenameMoveRemoveOnly: true,
+		client:    &IPCClient{},
+		ctx:       context.Background(),
+		files:     make(map[string]*ipcFileHandle),
+		dirs:      make(map[string]*cachedDir),
+		pathLocks: make(map[string]*sync.Mutex),
+		callFn:    callFn,
+	}
+
+	if rc := fs.Rmdir("/emptydir"); rc != 0 {
+		t.Errorf("Rmdir = %d, want 0", rc)
+	}
+	if got := removeCalls; got != 1 {
+		t.Errorf("removeCalls = %d, want 1", got)
+	}
+}
+
+func TestIpcErrToFuseMappings(t *testing.T) {
+	tests := []struct {
+		errMsg string
+		want   int
+	}{
+		{"read_only_filesystem", -fuse.EROFS},
+		{"not found", -fuse.ENOENT},
+		{"path not found", -fuse.ENOENT},
+		{"target already exists", -fuse.EEXIST},
+		{"already exists", -fuse.EEXIST},
+		{"not supported", -fuse.EOPNOTSUPP},
+		{"is not enabled", -fuse.EOPNOTSUPP},
+		{"verification failed", -fuse.EIO},
+		{"not a directory", -fuse.ENOTDIR},
+		{"target parent is not a directory", -fuse.ENOTDIR},
+		{"is a directory", -fuse.EISDIR},
+		{"not empty", -fuse.ENOTEMPTY},
+	}
+	for _, tt := range tests {
+		t.Run(tt.errMsg, func(t *testing.T) {
+			err := errors.New(tt.errMsg)
+			if got := ipcErrToFuse(err); got != tt.want {
+				t.Errorf("ipcErrToFuse(%q) = %d, want %d", tt.errMsg, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIpcErrToFuseFallbackToEIO(t *testing.T) {
+	// Unknown error should map to EIO
+	if got := ipcErrToFuse(errors.New("some unknown err")); got != -fuse.EIO {
+		t.Errorf("unknown error = %d, want %d", got, -fuse.EIO)
+	}
+}
+
+func TestNewRemoveModeOpenWriteRejected(t *testing.T) {
+	fs := &IPCFileSystem{mkdirRenameMoveFileRenameMoveRemoveOnly: true}
+	rc, _ := fs.Open("/f", int(os.O_WRONLY))
+	if rc != -fuse.EROFS {
+		t.Errorf("new17 Open(O_WRONLY) = %d, want EROFS", rc)
+	}
+	rc, _ = fs.Open("/f", int(os.O_RDWR))
+	if rc != -fuse.EROFS {
+		t.Errorf("new17 Open(O_RDWR) = %d, want EROFS", rc)
+	}
+	rc, _ = fs.Open("/f", int(os.O_TRUNC))
+	if rc != -fuse.EROFS {
+		t.Errorf("new17 Open(O_TRUNC) = %d, want EROFS", rc)
+	}
+	rc, _ = fs.Open("/f", int(os.O_APPEND))
+	if rc != -fuse.EROFS {
+		t.Errorf("new17 Open(O_APPEND) = %d, want EROFS", rc)
+	}
+}
+
+func TestNewRemoveModeCreateFileRejected(t *testing.T) {
+	fs := &IPCFileSystem{mkdirRenameMoveFileRenameMoveRemoveOnly: true}
+	rc, _ := fs.Create("/f.txt", fuse.O_CREAT|fuse.O_WRONLY, 0644)
+	if rc != -fuse.EROFS {
+		t.Errorf("new17 Create = %d, want EROFS", rc)
+	}
+}
+
+func TestNewRemoveModeWriteTruncateRejected(t *testing.T) {
+	fs := &IPCFileSystem{mkdirRenameMoveFileRenameMoveRemoveOnly: true}
+	if rc := fs.Write("/f", nil, 0, 0); rc != -fuse.EROFS {
+		t.Errorf("new17 Write = %d, want EROFS", rc)
+	}
+	if rc := fs.Truncate("/f", 0, 0); rc != -fuse.EROFS {
+		t.Errorf("new17 Truncate = %d, want EROFS", rc)
+	}
+}
+
+func TestNewRemoveModeChmodChownRejected(t *testing.T) {
+	fs := &IPCFileSystem{mkdirRenameMoveFileRenameMoveRemoveOnly: true}
+	if rc := fs.Chmod("/f", 0644); rc != -fuse.EROFS {
+		t.Errorf("new17 Chmod = %d, want EROFS", rc)
+	}
+	if rc := fs.Chown("/f", 0, 0); rc != -fuse.EROFS {
+		t.Errorf("new17 Chown = %d, want EROFS", rc)
+	}
+	if rc := fs.Utimens("/f", nil); rc != -fuse.EROFS {
+		t.Errorf("new17 Utimens = %d, want EROFS", rc)
+	}
+}
+
+func TestNewRemoveModeAccessFileDeleteAllowed(t *testing.T) {
+	// Root is always available and is a directory.
+	// The DELETE_OK check for new mode allows both files and dirs.
+	// We verify DELETE_OK passes on the root (a directory/object).
+	fs := &IPCFileSystem{mkdirRenameMoveFileRenameMoveRemoveOnly: true}
+	rc := fs.Access("/", fuse.DELETE_OK)
+	if rc != 0 {
+		t.Errorf("new17 Access(DELETE_OK) on root = %d, want 0", rc)
+	}
+}
+
+func TestNewRemoveModeDirIs0777(t *testing.T) {
+	fs := &IPCFileSystem{mkdirRenameMoveFileRenameMoveRemoveOnly: true}
+	var stat fuse.Stat_t
+	stat.Mode = fuse.S_IFDIR | 0555
+	fs.projectMode(&stat)
+	if stat.Mode != (fuse.S_IFDIR | 0777) {
+		t.Errorf("new17 dir mode = %#o, want %#o", stat.Mode, fuse.S_IFDIR|0777)
+	}
+}
+
+func TestNew18OpenWriteCreatesStagedHandle(t *testing.T) {
+	// In new18 mode, Open with write flags should create a staged upload handle (not EROFS).
+	callFn := func(req ipc.Request) (ipc.Response, error) {
+		if req.Type == "fs.stat" {
+			return ipc.Response{Type: req.Type, ID: req.ID, Error: "not found"}, nil
+		}
+		return ipc.Response{Type: req.Type, ID: req.ID}, nil
+	}
+	stagingDir := filepath.Join(t.TempDir(), "staging")
+	os.MkdirAll(stagingDir, 0700)
+	fs := &IPCFileSystem{
+		mkdirRenameMoveFileRenameMoveRemoveCopyUploadOnly: true,
+		ctx:       context.Background(),
+		files:     make(map[string]*ipcFileHandle),
+		dirs:      make(map[string]*cachedDir),
+		pathLocks: make(map[string]*sync.Mutex),
+		client:    &IPCClient{},
+		callFn:    callFn,
+		cacheDir:  t.TempDir(),
+	}
+	rc, _ := fs.Open("/new.txt", int(os.O_WRONLY))
+	if rc != 0 {
+		t.Errorf("new18 Open write flags = %d, want 0", rc)
+	}
+}
+
+func new18StagedTestFS(t *testing.T, exists bool) *IPCFileSystem {
+	t.Helper()
+	callFn := func(req ipc.Request) (ipc.Response, error) {
+		resp := ipc.Response{Type: req.Type, ID: req.ID}
+		if req.Type == "fs.stat" && !exists {
+			resp.Error = "not found"
+		}
+		return resp, nil
+	}
+	return &IPCFileSystem{
+		mkdirRenameMoveFileRenameMoveRemoveCopyUploadOnly: true,
+		ctx:       context.Background(),
+		files:     make(map[string]*ipcFileHandle),
+		dirs:      make(map[string]*cachedDir),
+		pathLocks: make(map[string]*sync.Mutex),
+		client:    &IPCClient{},
+		callFn:    callFn,
+		cacheDir:  t.TempDir(),
+	}
+}
+
+func TestNew18CreateNewUsesFailConflictPolicy(t *testing.T) {
+	fs := new18StagedTestFS(t, false)
+	rc, fh := fs.Create("/new.txt", fuse.O_CREAT|fuse.O_WRONLY, 0644)
+	if rc != 0 {
+		t.Fatalf("Create(new) = %d, want 0", rc)
+	}
+	h := fs.files["/new.txt"]
+	if h == nil || fh != h.fh || h.conflictPolicy != "fail" {
+		t.Fatalf("staged handle = %#v, fh=%d; want conflictPolicy=fail", h, fh)
+	}
+}
+
+func TestNew18CreateExistingWithoutTruncateReturnsEEXIST(t *testing.T) {
+	fs := new18StagedTestFS(t, true)
+	rc, _ := fs.Create("/same.txt", fuse.O_CREAT|fuse.O_WRONLY, 0644)
+	if rc != -fuse.EEXIST {
+		t.Fatalf("Create(existing) = %d, want %d", rc, -fuse.EEXIST)
+	}
+	if _, ok := fs.files["/same.txt"]; ok {
+		t.Fatal("Create(existing) created a staged upload handle")
+	}
+}
+
+func TestExplicitOverwriteRequiresTruncate(t *testing.T) {
+	for _, flags := range []int{os.O_WRONLY, os.O_RDWR, os.O_APPEND, os.O_CREATE | os.O_WRONLY} {
+		if isExplicitOverwriteRequest(flags) {
+			t.Errorf("flags %#x unexpectedly imply overwrite", flags)
+		}
+	}
+	if !isExplicitOverwriteRequest(os.O_WRONLY | os.O_TRUNC) {
+		t.Fatal("O_TRUNC did not imply overwrite")
+	}
+}
+
+func TestNew18ExistingWithTruncateUsesOverwritePolicy(t *testing.T) {
+	fs := new18StagedTestFS(t, true)
+	rc, _ := fs.Open("/same.txt", os.O_WRONLY|os.O_TRUNC)
+	if rc != 0 {
+		t.Fatalf("Open(existing, O_TRUNC) = %d, want 0", rc)
+	}
+	h := fs.files["/same.txt"]
+	if h == nil || h.conflictPolicy != "overwrite" {
+		t.Fatalf("staged handle = %#v; want conflictPolicy=overwrite", h)
+	}
+}
+
+func TestNew16OpenWriteStillRejected(t *testing.T) {
+	fs := &IPCFileSystem{
+		mkdirRenameMoveFileRenameMoveOnly: true,
+		files:     make(map[string]*ipcFileHandle),
+		dirs:      make(map[string]*cachedDir),
+		pathLocks: make(map[string]*sync.Mutex),
+		client:    &IPCClient{},
+	}
+	rc, _ := fs.Open("/f.txt", int(os.O_WRONLY))
+	if rc != -fuse.EROFS {
+		t.Errorf("new16 Open write flags = %d, want EROFS", rc)
+	}
+}

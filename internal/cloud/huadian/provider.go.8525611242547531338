@@ -1,0 +1,451 @@
+﻿// Package huadian implements the cloud.Provider interface for the
+// Huadian AnyShare cloud storage service.
+//
+// All HTTP endpoints are confirmed via browser HAR capture.
+// Unconfirmed interfaces return ErrNotImplemented.
+// Security: no passwords, tokens, or cookies are logged or stored in plaintext.
+package huadian
+
+import (
+	"bytes"
+	"context"
+	"crypto/md5"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"ncepupan/hdd/internal/cloud"
+	"ncepupan/hdd/internal/domain"
+)
+
+// Compile-time check.
+var _ cloud.Provider = (*Provider)(nil)
+
+// Sentinel errors.
+var (
+	ErrNotImplemented           = errors.New("huadian: not implemented")
+	ErrInteractiveLoginRequired = errors.New("huadian: interactive login required; obtain tokens via browser")
+	ErrUnauthorized             = errors.New("huadian: unauthorized")
+	ErrNotFound                 = errors.New("huadian: not found")
+)
+
+const (
+	baseURL        = "https://pan.ncepu.edu.cn"
+	defaultTimeout = 30 * time.Second
+)
+
+// Provider implements cloud.Provider for Huadian AnyShare.
+type Provider struct {
+	baseURL     string
+	accessToken string
+	client      *http.Client
+}
+
+// New creates a Provider.  accessToken may be empty (caller must supply
+// a valid token before making API calls), in which case Connect will
+// return ErrUnauthorized.
+func New(accessToken string) *Provider {
+	return &Provider{
+		baseURL:     baseURL,
+		accessToken: accessToken,
+		client: &http.Client{
+			Timeout: defaultTimeout,
+		},
+	}
+}
+
+func (p *Provider) Name() string { return "huadian" }
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+func (p *Provider) Connect(_ context.Context) error {
+	if p.accessToken == "" {
+		return ErrInteractiveLoginRequired
+	}
+	return nil
+}
+
+func (p *Provider) Disconnect(_ context.Context) error { return nil }
+
+// Login is not implemented.  Use the browser to obtain tokens.
+func (p *Provider) Login(ctx context.Context) error {
+	return ErrInteractiveLoginRequired
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+func (p *Provider) post(ctx context.Context, path string, body any, result any) error {
+	url := p.baseURL + path
+
+	var reqBody io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("marshal: %w", err)
+		}
+		reqBody = bytes.NewReader(data)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, reqBody)
+	if err != nil {
+		return fmt.Errorf("new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if p.accessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+p.accessToken)
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("http: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 401 {
+		return ErrUnauthorized
+	}
+	if resp.StatusCode == 404 {
+		return ErrNotFound
+	}
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("huadian: %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	if result != nil {
+		if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
+			return fmt.Errorf("decode: %w", err)
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// List
+// ---------------------------------------------------------------------------
+
+type dirListRequest struct {
+	DocID  string `json:"docid"`
+	ListBy string `json:"listby,omitempty"`
+	SortBy string `json:"sortby,omitempty"`
+	Reverse bool  `json:"reverse,omitempty"`
+	Count   int   `json:"count,omitempty"`
+}
+
+type dirListResponse struct {
+	Files []fileEntry `json:"files"`
+}
+
+type fileEntry struct {
+	DocID      string `json:"docid"`
+	Name       string `json:"name"`
+	Size       int64  `json:"size,omitempty"`
+	Rev        string `json:"rev"`
+	Modified   int64  `json:"modified"`   // microseconds
+	Editor     string `json:"editor"`
+	IsDir      bool   `json:"isdir"`
+}
+
+func (p *Provider) List(ctx context.Context, remotePath string) ([]domain.FileInfo, error) {
+	// The documented endpoint uses docid, not path.  Until path‑to‑docid
+	// lookup is confirmed, return ErrNotImplemented.
+	_ = remotePath
+	return nil, fmt.Errorf("huadian List(%q): %w", remotePath, ErrNotImplemented)
+}
+
+// ListByDocID performs a directory listing using a docid.
+func (p *Provider) ListByDocID(ctx context.Context, docID string) ([]domain.FileInfo, error) {
+	var resp dirListResponse
+	req := dirListRequest{DocID: docID, Count: 100}
+	if err := p.post(ctx, "/api/efast/v1/dir/list", req, &resp); err != nil {
+		return nil, err
+	}
+	var out []domain.FileInfo
+	for _, e := range resp.Files {
+		out = append(out, domain.FileInfo{
+			Path:    "/" + e.Name,
+			Size:    e.Size,
+			ModTime: time.UnixMicro(e.Modified),
+			IsDir:   e.IsDir,
+			ETag:    e.Rev,
+		})
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// Stat
+// ---------------------------------------------------------------------------
+
+type metadataRequest struct {
+	DocID string `json:"docid"`
+}
+
+type metadataResponse struct {
+	DocID  string `json:"docid"`
+	Name   string `json:"name"`
+	Size   int64  `json:"size,omitempty"`
+	Rev    string `json:"rev"`
+	Modified int64 `json:"modified"`
+}
+
+func (p *Provider) Stat(ctx context.Context, remotePath string) (domain.FileInfo, error) {
+	return domain.FileInfo{}, fmt.Errorf("huadian Stat(%q): %w", remotePath, ErrNotImplemented)
+}
+
+// StatByDocID returns metadata for a single file by docid.
+func (p *Provider) StatByDocID(ctx context.Context, docID string) (domain.FileInfo, error) {
+	var resp metadataResponse
+	if err := p.post(ctx, "/api/efast/v1/file/metadata", metadataRequest{DocID: docID}, &resp); err != nil {
+		return domain.FileInfo{}, err
+	}
+	return domain.FileInfo{
+		Path:    "/" + resp.Name,
+		Size:    resp.Size,
+		ModTime: time.UnixMicro(resp.Modified),
+		ETag:    resp.Rev,
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Upload
+// ---------------------------------------------------------------------------
+
+type predupRequest struct {
+	SliceMD5 string `json:"slice_md5"`
+	Length   int64  `json:"length"`
+}
+
+type predupResponse struct {
+	Match bool `json:"match"`
+}
+
+type osBeginUploadRequest struct {
+	DocID     string `json:"docid"`
+	Name      string `json:"name"`
+	Length    int64  `json:"length"`
+	OnDup     int    `json:"ondup,omitempty"`
+}
+
+type osBeginUploadResponse struct {
+	AuthRequest json.RawMessage `json:"authrequest"`
+	DocID       string          `json:"docid"`
+	Rev         string          `json:"rev"`
+	Name        string          `json:"name"`
+}
+
+type osEndUploadRequest struct {
+	DocID string `json:"docid"`
+	Rev   string `json:"rev"`
+}
+
+func (p *Provider) Upload(ctx context.Context, remotePath string, r io.Reader) error {
+	return fmt.Errorf("huadian Upload(%q): %w", remotePath, ErrNotImplemented)
+}
+
+// UploadByDocID performs the full AnyShare upload flow.
+func (p *Provider) UploadByDocID(ctx context.Context, parentDocID, name string, r io.Reader, size int64) error {
+	// Read content for MD5.
+	data, err := io.ReadAll(io.LimitReader(r, size+1))
+	if err != nil {
+		return fmt.Errorf("read upload: %w", err)
+	}
+	if int64(len(data)) != size {
+		return fmt.Errorf("size mismatch: got %d, want %d", len(data), size)
+	}
+
+	// Step 1: predupload (MD5 check).
+	md5Sum := fmt.Sprintf("%x", md5.Sum(data))
+	var predup predupResponse
+	if err := p.post(ctx, "/api/efast/v1/file/predupload", predupRequest{
+		SliceMD5: md5Sum,
+		Length:   size,
+	}, &predup); err != nil {
+		return fmt.Errorf("predupload: %w", err)
+	}
+	// If match==true, the file already exists — treat as success.
+	if predup.Match {
+		return nil
+	}
+
+	// Step 2: osbeginupload.
+	var begin osBeginUploadResponse
+	if err := p.post(ctx, "/api/efast/v1/file/osbeginupload", osBeginUploadRequest{
+		DocID:  parentDocID,
+		Name:   name,
+		Length: size,
+	}, &begin); err != nil {
+		return fmt.Errorf("osbeginupload: %w", err)
+	}
+
+	// Step 3: upload to object storage.
+	// authrequest contains the upload URL, policy, signature etc.
+	var ar authRequest
+	if err := json.Unmarshal(begin.AuthRequest, &ar); err != nil {
+		return fmt.Errorf("parse authrequest: %w", err)
+	}
+	if err := p.uploadToStorage(ctx, &ar, data); err != nil {
+		return fmt.Errorf("storage upload: %w", err)
+	}
+
+	// Step 4: osendupload.
+	if err := p.post(ctx, "/api/efast/v1/file/osendupload", osEndUploadRequest{
+		DocID: begin.DocID,
+		Rev:   begin.Rev,
+	}, nil); err != nil {
+		return fmt.Errorf("osendupload: %w", err)
+	}
+
+	return nil
+}
+
+type authRequest struct {
+	Method    string `json:"method"`
+	URL       string `json:"url"`
+	Policy    string `json:"policy,omitempty"`
+	Signature string `json:"signature,omitempty"`
+	Key       string `json:"key,omitempty"`
+}
+
+func (p *Provider) uploadToStorage(ctx context.Context, ar *authRequest, data []byte) error {
+	req, err := http.NewRequestWithContext(ctx, ar.Method, ar.URL, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("storage upload %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Download
+// ---------------------------------------------------------------------------
+
+type osDownloadRequest struct {
+	DocID string `json:"docid"`
+}
+
+type osDownloadResponse struct {
+	AuthRequest json.RawMessage `json:"authrequest"`
+}
+
+func (p *Provider) Download(ctx context.Context, remotePath string, w io.Writer) error {
+	return fmt.Errorf("huadian Download(%q): %w", remotePath, ErrNotImplemented)
+}
+
+// DownloadByDocID performs the AnyShare download flow.
+func (p *Provider) DownloadByDocID(ctx context.Context, docID string, w io.Writer) error {
+	var dl osDownloadResponse
+	if err := p.post(ctx, "/api/efast/v1/file/osdownload", osDownloadRequest{
+		DocID: docID,
+	}, &dl); err != nil {
+		return fmt.Errorf("osdownload: %w", err)
+	}
+
+	var ar authRequest
+	if err := json.Unmarshal(dl.AuthRequest, &ar); err != nil {
+		return fmt.Errorf("parse authrequest: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, ar.Method, ar.URL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("storage download %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	_, err = io.Copy(w, resp.Body)
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// Mkdir
+// ---------------------------------------------------------------------------
+
+type dirCreateRequest struct {
+	DocID string `json:"docid"`
+	Name  string `json:"name"`
+	OnDup  int   `json:"ondup,omitempty"`
+}
+
+func (p *Provider) Mkdir(ctx context.Context, remotePath string) error {
+	return fmt.Errorf("huadian Mkdir(%q): %w", remotePath, ErrNotImplemented)
+}
+
+// MkdirByDocID creates a directory under the given parent docid.
+func (p *Provider) MkdirByDocID(ctx context.Context, parentDocID, name string) error {
+	return p.post(ctx, "/api/efast/v1/dir/create", dirCreateRequest{
+		DocID: parentDocID,
+		Name:  name,
+	}, nil)
+}
+
+// ---------------------------------------------------------------------------
+// Rename
+// ---------------------------------------------------------------------------
+
+type renameRequest struct {
+	DocID string `json:"docid"`
+	Name  string `json:"name"`
+	OnDup  int   `json:"ondup,omitempty"`
+}
+
+func (p *Provider) Rename(ctx context.Context, oldPath, newPath string) error {
+	return fmt.Errorf("huadian Rename(%q, %q): %w", oldPath, newPath, ErrNotImplemented)
+}
+
+// RenameByDocID renames a file by docid.
+func (p *Provider) RenameByDocID(ctx context.Context, docID, newName string) error {
+	return p.post(ctx, "/api/efast/v1/file/rename", renameRequest{
+		DocID: docID,
+		Name:  newName,
+	}, nil)
+}
+
+// ---------------------------------------------------------------------------
+// Remove
+// ---------------------------------------------------------------------------
+
+type deleteRequest struct {
+	DocID string `json:"docid"`
+}
+
+func (p *Provider) Remove(ctx context.Context, remotePath string) error {
+	return fmt.Errorf("huadian Remove(%q): %w", remotePath, ErrNotImplemented)
+}
+
+// RemoveByDocID deletes a file or directory by docid.
+func (p *Provider) RemoveByDocID(ctx context.Context, docID string) error {
+	return p.post(ctx, "/api/efast/v1/file/delete", deleteRequest{
+		DocID: docID,
+	}, nil)
+}
+
+var (
+	_ = strconv.Itoa
+	_ = time.Now
+)

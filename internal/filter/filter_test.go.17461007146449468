@@ -1,0 +1,161 @@
+﻿package filter
+
+import (
+	"os"
+	"testing"
+	"time"
+)
+
+func TestDefaultExcludes(t *testing.T) {
+	rules := DefaultExcludes()
+	if len(rules) == 0 {
+		t.Fatal("default excludes is empty")
+	}
+}
+
+func TestNamePattern_TmpFile(t *testing.T) {
+	f := New([]Rule{{Type: RuleName, Pattern: "*.tmp"}})
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"file.tmp", true},
+		{"file.TMP", false},
+		{"file.txt", false},
+		{"dir/file.tmp", true},
+		{".tmp", false},
+		{"tmp", false},
+	}
+	for _, tt := range tests {
+		got := f.ExcludePath(tt.path)
+		if got != tt.want {
+			t.Errorf("ExcludePath(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
+func TestNamePattern_LogFile(t *testing.T) {
+	f := New([]Rule{{Type: RuleName, Pattern: "*.log"}})
+	if !f.ExcludePath("error.log") {
+		t.Error("should exclude .log")
+	}
+	if f.ExcludePath("error.txt") {
+		t.Error("should not exclude .txt")
+	}
+}
+
+func TestNamePattern_OfficeLock(t *testing.T) {
+	f := New([]Rule{{Type: RuleName, Pattern: "~$*"}})
+	if !f.ExcludePath("~$document.docx") {
+		t.Error("should exclude Office lock file")
+	}
+	if f.ExcludePath("document.docx") {
+		t.Error("should not exclude regular docx")
+	}
+}
+
+func TestPathComponent_GitDir(t *testing.T) {
+	f := New([]Rule{{Type: RulePath, Pattern: ".git"}})
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{".git/config", true},
+		{"project/.git/HEAD", true},
+		{"a/b/.git/objects/abc", true},
+		{"project/git.txt", false},
+		{".gitignore", false},
+		{"node_modules", false},
+	}
+	for _, tt := range tests {
+		got := f.ExcludePath(tt.path)
+		if got != tt.want {
+			t.Errorf("ExcludePath(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
+func TestPathComponent_NodeModules(t *testing.T) {
+	f := New([]Rule{{Type: RulePath, Pattern: "node_modules"}})
+	if !f.ExcludePath("node_modules/foo.js") {
+		t.Error("should exclude node_modules content")
+	}
+	if !f.ExcludePath("project/node_modules/bar/index.js") {
+		t.Error("should exclude nested node_modules")
+	}
+	if f.ExcludePath("src/modules.js") {
+		t.Error("should not exclude modules.js")
+	}
+}
+
+func TestSizeRule(t *testing.T) {
+	f := New([]Rule{{Type: RuleSize, MaxSize: 100}})
+	small := fakeFileInfo{size: 50}
+	large := fakeFileInfo{size: 200}
+	if f.Exclude("small.bin", small) {
+		t.Error("should not exclude small file")
+	}
+	if !f.Exclude("large.bin", large) {
+		t.Error("should exclude large file")
+	}
+}
+
+func TestSizeRule_500MiB(t *testing.T) {
+	f := New([]Rule{{Type: RuleSize, MaxSize: 500 * 1024 * 1024}})
+	under := fakeFileInfo{size: 100 * 1024 * 1024}
+	over := fakeFileInfo{size: 600 * 1024 * 1024}
+	if f.Exclude("under.bin", under) {
+		t.Error("100 MiB should not be excluded")
+	}
+	if !f.Exclude("over.bin", over) {
+		t.Error("600 MiB should be excluded")
+	}
+}
+
+func TestCombinedRules(t *testing.T) {
+	f := New(DefaultExcludes())
+	if !f.ExcludePath("build/output.tmp") {
+		t.Error("*.tmp should be excluded")
+	}
+	if !f.ExcludePath("logs/server.log") {
+		t.Error("*.log should be excluded")
+	}
+	if !f.ExcludePath("~$temp.xlsx") {
+		t.Error("~$* should be excluded")
+	}
+	if !f.ExcludePath(".git/objects/pack/abc") {
+		t.Error(".git should be excluded")
+	}
+	if !f.ExcludePath("frontend/node_modules/react/index.js") {
+		t.Error("node_modules should be excluded")
+	}
+	big := fakeFileInfo{size: 600 * 1024 * 1024}
+	if !f.Exclude("huge.iso", big) {
+		t.Error("> 500 MiB should be excluded")
+	}
+	if f.ExcludePath("src/main.go") {
+		t.Error("main.go should not be excluded")
+	}
+	if f.ExcludePath("docs/readme.md") {
+		t.Error("readme.md should not be excluded")
+	}
+}
+
+func TestWindowsBackslash(t *testing.T) {
+	f := New([]Rule{{Type: RulePath, Pattern: ".git"}})
+	if !f.ExcludePath("C:\\project\\.git\\HEAD") {
+		t.Error("should handle Windows backslash paths")
+	}
+}
+
+type fakeFileInfo struct {
+	size int64
+	dir  bool
+}
+
+func (f fakeFileInfo) Name() string       { return "" }
+func (f fakeFileInfo) Size() int64        { return f.size }
+func (f fakeFileInfo) Mode() os.FileMode  { return 0 }
+func (f fakeFileInfo) ModTime() time.Time { return time.Time{} }
+func (f fakeFileInfo) IsDir() bool        { return f.dir }
+func (f fakeFileInfo) Sys() any           { return nil }

@@ -1,0 +1,227 @@
+﻿// Package mock provides a filesystem-backed Provider for testing and development.
+package mock
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"ncepupan/hdd/internal/cloud"
+	"ncepupan/hdd/internal/domain"
+)
+
+// Compile-time check: MockProvider satisfies cloud.Provider.
+var _ cloud.Provider = (*MockProvider)(nil)
+
+// MockProvider is a filesystem-backed cloud provider for testing.
+// Remote paths are mapped under the local root directory.
+type MockProvider struct {
+	root string
+}
+
+// New creates a MockProvider rooted at dir.
+// The caller is responsible for cleaning up dir.
+func New(dir string) *MockProvider {
+	return &MockProvider{root: dir}
+}
+
+// Root returns the local root directory for inspection in tests.
+func (m *MockProvider) Root() string { return m.root }
+
+func (m *MockProvider) Name() string { return "mock" }
+
+func (m *MockProvider) Connect(_ context.Context) error    { return nil }
+func (m *MockProvider) Disconnect(_ context.Context) error { return nil }
+
+// localPath converts a remote slash-separated path to a local filesystem path.
+// It rejects paths that attempt to escape the root.
+func (m *MockProvider) localPath(remotePath string) (string, error) {
+	clean := filepath.Clean(filepath.FromSlash(strings.TrimLeft(remotePath, "/")))
+	if filepath.IsAbs(clean) {
+		return "", fmt.Errorf("mock: path must be relative: %q", remotePath)
+	}
+	abs := filepath.Join(m.root, clean)
+	// Guard against traversal: abs must be under root.
+	rel, err := filepath.Rel(m.root, abs)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return "", fmt.Errorf("mock: path escapes root: %q", remotePath)
+	}
+	return abs, nil
+}
+
+// remotePath converts a local path back to a slash-separated remote path.
+func (m *MockProvider) remotePath(local string) string {
+	rel, err := filepath.Rel(m.root, local)
+	if err != nil {
+		return "/"
+	}
+	return "/" + filepath.ToSlash(rel)
+}
+
+func (m *MockProvider) List(_ context.Context, remotePath string) ([]domain.FileInfo, error) {
+	abs, err := m.localPath(remotePath)
+	if err != nil {
+		return nil, err
+	}
+
+	entries, err := os.ReadDir(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("mock: readdir %q: %w", remotePath, err)
+	}
+
+	results := make([]domain.FileInfo, 0, len(entries))
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		results = append(results, domain.FileInfo{
+			Path:    m.remotePath(filepath.Join(abs, e.Name())),
+			Size:    info.Size(),
+			ModTime: info.ModTime().Truncate(time.Second),
+			IsDir:   info.IsDir(),
+		})
+	}
+	return results, nil
+}
+
+func (m *MockProvider) Stat(_ context.Context, remotePath string) (domain.FileInfo, error) {
+	abs, err := m.localPath(remotePath)
+	if err != nil {
+		return domain.FileInfo{}, err
+	}
+
+	info, err := os.Stat(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return domain.FileInfo{}, fmt.Errorf("mock: not found: %q", remotePath)
+		}
+		return domain.FileInfo{}, fmt.Errorf("mock: stat %q: %w", remotePath, err)
+	}
+	return domain.FileInfo{
+		Path:    m.remotePath(abs),
+		Size:    info.Size(),
+		ModTime: info.ModTime().Truncate(time.Second),
+		IsDir:   info.IsDir(),
+	}, nil
+}
+
+func (m *MockProvider) Upload(_ context.Context, remotePath string, r io.Reader) error {
+	abs, err := m.localPath(remotePath)
+	if err != nil {
+		return err
+	}
+
+	// Ensure parent directories exist.
+	dir := filepath.Dir(abs)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("mock: mkdir parent %q: %w", remotePath, err)
+	}
+
+	f, err := os.Create(abs)
+	if err != nil {
+		return fmt.Errorf("mock: create %q: %w", remotePath, err)
+	}
+	defer f.Close()
+
+	if _, err := io.Copy(f, r); err != nil {
+		return fmt.Errorf("mock: write %q: %w", remotePath, err)
+	}
+	return nil
+}
+
+func (m *MockProvider) Download(_ context.Context, remotePath string, w io.Writer) error {
+	abs, err := m.localPath(remotePath)
+	if err != nil {
+		return err
+	}
+
+	f, err := os.Open(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("mock: not found: %q", remotePath)
+		}
+		return fmt.Errorf("mock: open %q: %w", remotePath, err)
+	}
+	defer f.Close()
+
+	if _, err := io.Copy(w, f); err != nil {
+		return fmt.Errorf("mock: read %q: %w", remotePath, err)
+	}
+	return nil
+}
+
+func (m *MockProvider) Mkdir(_ context.Context, remotePath string) error {
+	abs, err := m.localPath(remotePath)
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(abs, 0700); err != nil {
+		return fmt.Errorf("mock: mkdir %q: %w", remotePath, err)
+	}
+	return nil
+}
+
+func (m *MockProvider) Remove(_ context.Context, remotePath string) error {
+	abs, err := m.localPath(remotePath)
+	if err != nil {
+		return err
+	}
+
+	info, err := os.Stat(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("mock: not found: %q", remotePath)
+		}
+		return fmt.Errorf("mock: stat %q: %w", remotePath, err)
+	}
+
+	if info.IsDir() {
+		entries, _ := os.ReadDir(abs)
+		if len(entries) > 0 {
+			return fmt.Errorf("mock: directory not empty: %q", remotePath)
+		}
+	}
+
+	if err := os.Remove(abs); err != nil {
+		return fmt.Errorf("mock: remove %q: %w", remotePath, err)
+	}
+	return nil
+}
+
+func (m *MockProvider) Rename(_ context.Context, oldPath, newPath string) error {
+	oldAbs, err := m.localPath(oldPath)
+	if err != nil {
+		return err
+	}
+	newAbs, err := m.localPath(newPath)
+	if err != nil {
+		return err
+	}
+
+	if _, err := os.Stat(oldAbs); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("mock: not found: %q", oldPath)
+		}
+		return fmt.Errorf("mock: stat %q: %w", oldPath, err)
+	}
+
+	// Ensure parent of destination exists.
+	dir := filepath.Dir(newAbs)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("mock: mkdir parent %q: %w", newPath, err)
+	}
+
+	if err := os.Rename(oldAbs, newAbs); err != nil {
+		return fmt.Errorf("mock: rename %q -> %q: %w", oldPath, newPath, err)
+	}
+	return nil
+}

@@ -1,0 +1,598 @@
+package huadian
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+const secretSentinel = "SECRET_COOKIE_TOKEN_AUTH_OAUTH_CAS_ROOT_USER_ACCOUNT_BODY"
+
+func captureProcessOutput(t *testing.T, fn func() error) (string, error) {
+	t.Helper()
+	oldOut, oldErr, oldLogger := os.Stdout, os.Stderr, slog.Default()
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout, os.Stderr = outW, errW
+	slog.SetDefault(slog.New(slog.NewTextHandler(errW, nil)))
+
+	var stdout, stderr bytes.Buffer
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(&stdout, outR); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(&stderr, errR); done <- struct{}{} }()
+	callErr := fn()
+	_ = outW.Close()
+	_ = errW.Close()
+	<-done
+	<-done
+	os.Stdout, os.Stderr = oldOut, oldErr
+	slog.SetDefault(oldLogger)
+	_ = outR.Close()
+	_ = errR.Close()
+	return stdout.String() + stderr.String(), callErr
+}
+
+func assertSecretAbsent(t *testing.T, output string, err error) {
+	t.Helper()
+	combined := output
+	if err != nil {
+		combined += err.Error()
+	}
+	for _, secret := range []string{secretSentinel, "Authorization: Bearer", "oauth_code=", "ticket=", "signature="} {
+		if strings.Contains(combined, secret) {
+			t.Fatalf("sensitive value %q leaked: %s", secret, combined)
+		}
+	}
+}
+
+func TestName(t *testing.T) {
+	p := New("")
+	if p.Name() != "huadian" {
+		t.Errorf("name = %q, want %q", p.Name(), "huadian")
+	}
+}
+
+func TestConnect_EmptyToken(t *testing.T) {
+	p := New("")
+	err := p.Connect(context.Background())
+	if err != ErrInteractiveLoginRequired {
+		t.Errorf("err = %v, want ErrInteractiveLoginRequired", err)
+	}
+}
+
+func TestConnect_WithToken(t *testing.T) {
+	p := New("test-token")
+	err := p.Connect(context.Background())
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestDisconnect(t *testing.T) {
+	p := New("")
+	if err := p.Disconnect(context.Background()); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestLogin_NotImplemented(t *testing.T) {
+	p := New("")
+	if err := p.Login(context.Background()); err != ErrInteractiveLoginRequired {
+		t.Errorf("err = %v, want ErrInteractiveLoginRequired", err)
+	}
+}
+
+func TestCompileCheck(t *testing.T) {
+	var _ Provider
+}
+
+// fakeServer creates an httptest.Server that responds to AnyShare API calls.
+func fakeServer(t *testing.T) (*httptest.Server, *fakeState) {
+	t.Helper()
+	st := &fakeState{
+		entries: map[string]fakeEntry{
+			"root":    {docID: "root", name: "", isDir: true},
+			"d-dir1":  {docID: "d-dir1", name: "dir1", isDir: true, modified: time.Now().UnixMicro(), rev: "r1"},
+			"d-file1": {docID: "d-file1", name: "file1.txt", size: 17, isDir: false, modified: time.Now().UnixMicro(), rev: "r2"},
+		},
+		rootChildren: []string{"d-dir1", "d-file1"},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/efast/v1/dir/list", st.handleDirList)
+	mux.HandleFunc("/api/efast/v1/file/metadata", st.handleMetadata)
+	mux.HandleFunc("/api/efast/v1/file/predupload", st.handlePredupload)
+	mux.HandleFunc("/api/efast/v1/file/osbeginupload", st.handleOsBeginUpload)
+	mux.HandleFunc("/api/efast/v1/file/osendupload", st.handleOsEndUpload)
+	mux.HandleFunc("/api/efast/v1/file/osdownload", st.handleOsDownload)
+	mux.HandleFunc("/api/efast/v1/dir/create", st.handleDirCreate)
+	mux.HandleFunc("/api/efast/v1/file/rename", st.handleRename)
+	mux.HandleFunc("/api/efast/v1/file/delete", st.handleDelete)
+	mux.HandleFunc("/storage/upload", st.handleStorageUpload)
+	mux.HandleFunc("/storage/download", st.handleStorageDownload)
+	srv := httptest.NewServer(mux)
+	st.serverURL = srv.URL
+	return srv, st
+}
+
+type fakeEntry struct {
+	docID    string
+	name     string
+	size     int64
+	rev      string
+	modified int64
+	isDir    bool
+}
+
+type fakeState struct {
+	entries      map[string]fakeEntry
+	rootChildren []string
+	serverURL    string
+	downloadData []byte
+	seq          int64
+}
+
+func (s *fakeState) nextID() string {
+	return fmt.Sprintf("doc-%d", atomic.AddInt64(&s.seq, 1))
+}
+
+func (s *fakeState) handleDirList(w http.ResponseWriter, r *http.Request) {
+	var req dirListRequest
+	json.NewDecoder(r.Body).Decode(&req)
+	resp := dirListResponse{}
+	if req.DocID == "root" {
+		for _, childID := range s.rootChildren {
+			e := s.entries[childID]
+			resp.Files = append(resp.Files, fileEntry{
+				DocID:    e.docID,
+				Name:     e.name,
+				Size:     e.size,
+				Rev:      e.rev,
+				Modified: e.modified,
+				IsDir:    e.isDir,
+			})
+		}
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *fakeState) handleMetadata(w http.ResponseWriter, r *http.Request) {
+	var req metadataRequest
+	json.NewDecoder(r.Body).Decode(&req)
+	e, ok := s.entries[req.DocID]
+	if !ok {
+		w.WriteHeader(404)
+		return
+	}
+	json.NewEncoder(w).Encode(metadataResponse{
+		DocID:    e.docID,
+		Name:     e.name,
+		Size:     e.size,
+		Rev:      e.rev,
+		Modified: e.modified,
+		IsDir:    e.isDir,
+	})
+}
+
+func (s *fakeState) handlePredupload(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(predupResponse{Match: false})
+}
+
+func (s *fakeState) handleOsBeginUpload(w http.ResponseWriter, r *http.Request) {
+	var req osBeginUploadRequest
+	json.NewDecoder(r.Body).Decode(&req)
+	docID := s.nextID()
+	s.entries[docID] = fakeEntry{
+		docID:    docID,
+		name:     req.Name,
+		size:     req.Length,
+		isDir:    false,
+		modified: time.Now().UnixMicro(),
+		rev:      "rev-1",
+	}
+	s.rootChildren = append(s.rootChildren, docID)
+	ar, _ := json.Marshal(authRequest{
+		Method: "PUT",
+		URL:    s.serverURL + "/storage/upload",
+	})
+	json.NewEncoder(w).Encode(osBeginUploadResponse{
+		AuthRequest: ar,
+		DocID:       docID,
+		Rev:         "rev-1",
+		Name:        req.Name,
+	})
+}
+
+func (s *fakeState) handleOsEndUpload(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *fakeState) handleOsDownload(w http.ResponseWriter, r *http.Request) {
+	var req osDownloadRequest
+	json.NewDecoder(r.Body).Decode(&req)
+	e, ok := s.entries[req.DocID]
+	if !ok {
+		w.WriteHeader(404)
+		return
+	}
+	ar, _ := json.Marshal([]string{"GET", s.serverURL + "/storage/download"})
+	now := time.Now().UnixMicro()
+	json.NewEncoder(w).Encode(osDownloadResponse{
+		AuthRequest: ar,
+		Name:        e.name,
+		Size:        e.size,
+		Rev:         e.rev,
+		Modified:    now,
+		ClientMtime: now,
+	})
+}
+
+func (s *fakeState) handleDirCreate(w http.ResponseWriter, r *http.Request) {
+	var req dirCreateRequest
+	json.NewDecoder(r.Body).Decode(&req)
+	docID := s.nextID()
+	s.entries[docID] = fakeEntry{
+		docID:    docID,
+		name:     req.Name,
+		isDir:    true,
+		modified: time.Now().UnixMicro(),
+		rev:      "rev-1",
+	}
+	s.rootChildren = append(s.rootChildren, docID)
+	json.NewEncoder(w).Encode(map[string]string{"docid": docID})
+}
+
+func (s *fakeState) handleRename(w http.ResponseWriter, r *http.Request) {
+	var req renameRequest
+	json.NewDecoder(r.Body).Decode(&req)
+	if e, ok := s.entries[req.DocID]; ok {
+		e.name = req.Name
+		s.entries[req.DocID] = e
+	}
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *fakeState) handleDelete(w http.ResponseWriter, r *http.Request) {
+	var req deleteRequest
+	json.NewDecoder(r.Body).Decode(&req)
+	delete(s.entries, req.DocID)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *fakeState) handleStorageUpload(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(200)
+}
+
+func (s *fakeState) handleStorageDownload(w http.ResponseWriter, r *http.Request) {
+	data := s.downloadData
+	if len(data) == 0 {
+		data = []byte("hello from storage")
+	}
+	w.Write(data)
+}
+
+func newTestProvider(t *testing.T, srv *httptest.Server) *Provider {
+	t.Helper()
+	p := New("test-token")
+	p.baseURL = srv.URL
+	p.client = srv.Client()
+	return p
+}
+
+func TestProvider_List(t *testing.T) {
+	srv, _ := fakeServer(t)
+	defer srv.Close()
+	p := newTestProvider(t, srv)
+	p.SetRootDocID("root")
+
+	entries, err := p.List(context.Background(), "/")
+	if err != nil {
+		t.Fatalf("List(/): %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	seen := map[string]bool{}
+	for _, e := range entries {
+		seen[e.Path] = true
+	}
+	if !seen["/dir1"] {
+		t.Errorf("missing /dir1 in %v", entries)
+	}
+	if !seen["/file1.txt"] {
+		t.Errorf("missing /file1.txt in %v", entries)
+	}
+}
+
+func TestProvider_Stat(t *testing.T) {
+	srv, _ := fakeServer(t)
+	defer srv.Close()
+	p := newTestProvider(t, srv)
+	p.SetRootDocID("root")
+
+	p.List(context.Background(), "/")
+	info, err := p.Stat(context.Background(), "/dir1")
+	if err != nil {
+		t.Fatalf("Stat(/dir1): %v", err)
+	}
+	if info.Path != "/dir1" {
+		t.Errorf("path = %q, want /dir1", info.Path)
+	}
+	if !info.IsDir {
+		t.Error("expected IsDir")
+	}
+}
+
+func TestProvider_Upload(t *testing.T) {
+	srv, _ := fakeServer(t)
+	defer srv.Close()
+	p := newTestProvider(t, srv)
+	p.SetRootDocID("root")
+
+	err := p.Upload(context.Background(), "/newfile.txt", bytes.NewReader([]byte("content")))
+	if err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	info, err := p.Stat(context.Background(), "/newfile.txt")
+	if err != nil {
+		t.Fatalf("Stat after upload: %v", err)
+	}
+	if info.Size != 7 {
+		t.Errorf("size = %d, want 7", info.Size)
+	}
+}
+
+func TestProvider_Download(t *testing.T) {
+	srv, _ := fakeServer(t)
+	defer srv.Close()
+	p := newTestProvider(t, srv)
+	p.SetRootDocID("root")
+
+	var buf bytes.Buffer
+	err := p.Download(context.Background(), "/file1.txt", &buf)
+	if err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if buf.String() != "hello from storage" {
+		t.Errorf("data = %q, want %q", buf.String(), "hello from storage")
+	}
+}
+
+func TestProvider_Mkdir(t *testing.T) {
+	srv, _ := fakeServer(t)
+	defer srv.Close()
+	p := newTestProvider(t, srv)
+	p.SetRootDocID("root")
+
+	err := p.Mkdir(context.Background(), "/newdir")
+	if err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+}
+
+func TestProvider_Rename(t *testing.T) {
+	srv, _ := fakeServer(t)
+	defer srv.Close()
+	p := newTestProvider(t, srv)
+	p.SetRootDocID("root")
+
+	err := p.Rename(context.Background(), "/file1.txt", "/renamed.txt")
+	if err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+}
+
+func TestProvider_Remove(t *testing.T) {
+	srv, _ := fakeServer(t)
+	defer srv.Close()
+	p := newTestProvider(t, srv)
+	p.SetRootDocID("root")
+
+	err := p.Remove(context.Background(), "/file1.txt")
+	if err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+}
+
+func TestProvider_403MapsToUnauthorized(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(403)
+	}))
+	defer srv.Close()
+	p := newTestProvider(t, srv)
+	p.SetRootDocID("root")
+
+	_, err := p.List(context.Background(), "/")
+	if err != ErrUnauthorized {
+		t.Errorf("expected ErrUnauthorized for 403, got %v", err)
+	}
+}
+
+func TestAuthRequest_ParseObject(t *testing.T) {
+	raw := json.RawMessage(`{"method":"PUT","url":"http://example.com/upload"}`)
+	ar, err := parseAuthRequest(raw)
+	if err != nil {
+		t.Fatalf("parseAuthRequest: %v", err)
+	}
+	if ar.Method != "PUT" || ar.URL != "http://example.com/upload" {
+		t.Errorf("parsed = %+v", ar)
+	}
+}
+
+func TestAuthRequest_ParseArray(t *testing.T) {
+	raw := json.RawMessage(`[{"method":"POST","url":"http://example.com/1"},{"method":"PUT","url":"http://example.com/2"}]`)
+	ar, err := parseAuthRequest(raw)
+	if err != nil {
+		t.Fatalf("parseAuthRequest: %v", err)
+	}
+	if ar.Method != "POST" || ar.URL != "http://example.com/1" {
+		t.Errorf("parsed = %+v, want first element", ar)
+	}
+}
+
+func TestAuthRequest_ParseEmpty(t *testing.T) {
+	_, err := parseAuthRequest(json.RawMessage(``))
+	if err == nil {
+		t.Error("expected error for empty authrequest")
+	}
+}
+
+func TestAuthRequest_ParseInvalid(t *testing.T) {
+	_, err := parseAuthRequest(json.RawMessage(`"not an object or array"`))
+	if err == nil {
+		t.Error("expected error for invalid authrequest")
+	}
+}
+
+func TestAuthRequest_ParseStringArray(t *testing.T) {
+	raw := json.RawMessage(`["GET","https://pan.ncepu.edu.cn/bucket/abc/file?Signature=xyz"]`)
+	ar, err := parseAuthRequest(raw)
+	if err != nil {
+		t.Fatalf("parseAuthRequest string array: %v", err)
+	}
+	if ar.Method != "GET" || ar.URL != "https://pan.ncepu.edu.cn/bucket/abc/file?Signature=xyz" {
+		t.Errorf("parsed = %+v", ar)
+	}
+}
+
+func TestOsDownloadResponse_Full(t *testing.T) {
+	srv, st := fakeServer(t)
+	defer srv.Close()
+	// Override the storage download to return a known payload.
+	st.downloadData = []byte("downloaded content")
+	p := newTestProvider(t, srv)
+	p.SetRootDocID("root")
+
+	var buf bytes.Buffer
+	err := p.Download(context.Background(), "/file1.txt", &buf)
+	if err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if buf.String() != "downloaded content" {
+		t.Errorf("data = %q, want %q", buf.String(), "downloaded content")
+	}
+}
+
+func TestPredupMatch_StillCallsOsEndUpload(t *testing.T) {
+	var beginCalled, endCalled int32
+	var serverURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "predupload"):
+			json.NewEncoder(w).Encode(predupResponse{Match: true})
+		case strings.Contains(r.URL.Path, "osbeginupload"):
+			atomic.StoreInt32(&beginCalled, 1)
+			ar, _ := json.Marshal(authRequest{Method: "PUT", URL: serverURL + "/storage/upload"})
+			json.NewEncoder(w).Encode(osBeginUploadResponse{
+				AuthRequest: ar, DocID: "d1", Rev: "r1", Name: "f.txt",
+			})
+		case strings.Contains(r.URL.Path, "osendupload"):
+			atomic.StoreInt32(&endCalled, 1)
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			w.WriteHeader(200)
+		}
+	}))
+	serverURL = srv.URL
+	defer srv.Close()
+	p := newTestProvider(t, srv)
+	p.SetRootDocID("root")
+
+	err := p.UploadByDocID(context.Background(), "root", "f.txt", bytes.NewReader([]byte{}), 0)
+	if err != nil {
+		t.Fatalf("UploadByDocID: %v", err)
+	}
+	if atomic.LoadInt32(&beginCalled) == 0 {
+		t.Error("osbeginupload was not called (needed for directory association)")
+	}
+	if atomic.LoadInt32(&endCalled) == 0 {
+		t.Error("osendupload was not called (needed for directory association)")
+	}
+}
+
+func TestProviderHTTPErrorLogsDoNotLeakSecrets(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusInternalServerError} {
+		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Request-ID", "safe-request-id")
+				w.WriteHeader(status)
+				_, _ = io.WriteString(w, secretSentinel+" Authorization: Bearer "+secretSentinel)
+			}))
+			defer server.Close()
+			p := New("internal-token-" + secretSentinel)
+			p.baseURL = server.URL
+
+			output, err := captureProcessOutput(t, func() error {
+				return p.post(context.Background(), "/private/path?oauth_code="+secretSentinel+"&ticket="+secretSentinel, nil, nil)
+			})
+			if err == nil {
+				t.Fatal("expected HTTP error")
+			}
+			assertSecretAbsent(t, output, err)
+			if !strings.Contains(output, fmt.Sprintf("status=%d", status)) {
+				t.Fatalf("safe status missing from log: %s", output)
+			}
+		})
+	}
+}
+
+func TestStorageUploadErrorDoesNotLeakSecrets(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Request-ID", "upload-request")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, secretSentinel)
+	}))
+	defer server.Close()
+	p := New("")
+	ar := &authRequest{
+		Method: "PUT",
+		URL: server.URL + "/private/upload?signature=" + secretSentinel,
+		Headers: map[string]string{"Authorization": "Bearer " + secretSentinel},
+	}
+
+	output, err := captureProcessOutput(t, func() error {
+		return p.uploadToStorage(context.Background(), ar, []byte("payload"))
+	})
+	if err == nil {
+		t.Fatal("expected upload error")
+	}
+	assertSecretAbsent(t, output, err)
+}
+
+func TestStorageDownloadErrorDoesNotLeakSecrets(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Request-ID", "download-request")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, secretSentinel)
+	}))
+	defer server.Close()
+	p := New("")
+	ar := &authRequest{
+		Method: "GET",
+		URL: server.URL + "/private/download?signature=" + secretSentinel,
+		Headers: map[string]string{"Authorization": "Bearer " + secretSentinel},
+	}
+
+	output, err := captureProcessOutput(t, func() error {
+		return p.downloadFromStorage(context.Background(), ar, io.Discard)
+	})
+	if err == nil {
+		t.Fatal("expected download error")
+	}
+	assertSecretAbsent(t, output, err)
+}

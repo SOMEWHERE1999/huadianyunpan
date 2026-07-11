@@ -1,0 +1,147 @@
+﻿// hddsyncd is the background synchronization daemon for the Huadian Drive
+// cloud storage service. It watches configured directories and keeps them
+// synchronized with the cloud provider.
+package main
+
+import (
+	"bytes"
+	"context"
+	"flag"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"time"
+
+	"ncepupan/hdd/internal/app"
+	"ncepupan/hdd/internal/cloud/mock"
+	"ncepupan/hdd/internal/domain"
+	"ncepupan/hdd/internal/platform/windows/service"
+)
+
+func main() {
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		out.Write([]byte("Usage: hddsyncd [command]\n\n"))
+		out.Write([]byte("Commands:\n"))
+		out.Write([]byte("  version              Print version information\n"))
+		out.Write([]byte("  run                  Start the daemon in console mode\n"))
+		out.Write([]byte("  help                 Print this help message\n"))
+		out.Write([]byte("  service <cmd> [args] Windows service management\n"))
+		out.Write([]byte("\nService commands:\n"))
+		out.Write([]byte("  service install      Install as Windows service\n"))
+		out.Write([]byte("  service uninstall    Remove Windows service\n"))
+		out.Write([]byte("  service start        Start the service\n"))
+		out.Write([]byte("  service stop         Stop the service\n"))
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	args := flag.Args()
+	cmd := "help"
+	if len(args) > 0 {
+		cmd = args[0]
+	}
+
+	switch cmd {
+	case "version":
+		app.PrintVersion("hddsyncd")
+	case "run":
+		runDaemon()
+	case "service":
+		runServiceCmd(args[1:])
+	case "help", "-h", "--help":
+		flag.Usage()
+	default:
+		fmt.Fprintf(os.Stderr, "hddsyncd: unknown command %q\n", cmd)
+		flag.Usage()
+		os.Exit(1)
+	}
+}
+
+func runServiceCmd(args []string) {
+	subcmd := "help"
+	if len(args) > 0 {
+		subcmd = args[0]
+	}
+	svcName := "hddsyncd"
+	svcDisplay := "Huadian Drive Sync Daemon"
+
+	var err error
+	switch subcmd {
+	case "install":
+		err = service.Install(svcName, svcDisplay, "")
+	case "uninstall":
+		err = service.Uninstall(svcName)
+	case "start":
+		err = service.Start(svcName)
+	case "stop":
+		err = service.Stop(svcName)
+	default:
+		fmt.Fprintf(os.Stderr, "hddsyncd service: unknown subcommand %q\n", subcmd)
+		os.Exit(1)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hddsyncd service %s: %v\n", subcmd, err)
+		os.Exit(2)
+	}
+	fmt.Printf("service %s: ok\n", subcmd)
+}
+
+func runDaemon() {
+	mockDir, err := os.MkdirTemp("", "hddsyncd-mock-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hddsyncd: create mock dir: %v\n", err)
+		os.Exit(1)
+	}
+	defer os.RemoveAll(mockDir)
+
+	prov := mock.New(mockDir)
+	prov.Mkdir(context.Background(), "/test")
+	prov.Upload(context.Background(), "/test/hello.txt",
+		bytes.NewReader([]byte("hello world")))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt)
+	defer signal.Stop(ch)
+
+	slog.Info("hddsyncd starting", "provider", prov.Name())
+
+	entries, err := prov.List(ctx, "/")
+	if err != nil {
+		slog.Error("list files failed", "error", err)
+	} else {
+		for _, e := range entries {
+			slog.Info("found remote entry", "path", e.Path, "size", e.Size, "isdir", e.IsDir)
+		}
+	}
+
+	root := domain.SyncRoot{LocalPath: ".", RemotePath: "/"}
+	slog.Info("sync root registered", "local", root.LocalPath, "remote", root.RemotePath)
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	slog.Info("hddsyncd ready (mock mode)")
+
+	for {
+		select {
+		case <-ch:
+			slog.Info("shutting down")
+			return
+		case <-ticker.C:
+			entries, err := prov.List(ctx, "/")
+			if err != nil {
+				slog.Error("poll error", "error", err)
+				continue
+			}
+			slog.Debug("poll ok", "count", len(entries))
+		case <-ctx.Done():
+			slog.Info("context canceled, exiting")
+			return
+		}
+	}
+}

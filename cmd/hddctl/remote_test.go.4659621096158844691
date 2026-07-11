@@ -1,0 +1,277 @@
+﻿package main
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"ncepupan/hdd/internal/cloud/mock"
+)
+
+// setup creates a mock provider with a fresh temp root.
+func setup(t *testing.T) *mock.MockProvider {
+	t.Helper()
+	return mock.New(t.TempDir())
+}
+
+// TestRemoteLs_Success verifies ls lists uploaded entries.
+func TestRemoteLs_Success(t *testing.T) {
+	prov := setup(t)
+	ctx := context.Background()
+	prov.Upload(ctx, "/a.txt", strings.NewReader("a"))
+	prov.Upload(ctx, "/b.txt", strings.NewReader("bb"))
+	prov.Mkdir(ctx, "/sub")
+
+	code := runRemoteCmd(prov, []string{"ls", "/"})
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+}
+
+// TestRemoteLs_MissingArg returns error for no path.
+func TestRemoteLs_MissingArg(t *testing.T) {
+	prov := setup(t)
+	code := runRemoteCmd(prov, []string{"ls"})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+// TestRemoteStat_Found returns 0.
+func TestRemoteStat_Found(t *testing.T) {
+	prov := setup(t)
+	prov.Upload(context.Background(), "/x.txt", strings.NewReader("hello"))
+
+	code := runRemoteCmd(prov, []string{"stat", "/x.txt"})
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+}
+
+// TestRemoteStat_NotFound returns non-zero.
+func TestRemoteStat_NotFound(t *testing.T) {
+	prov := setup(t)
+	code := runRemoteCmd(prov, []string{"stat", "/no/such"})
+	if code == 0 {
+		t.Fatal("expected non-zero exit for missing file")
+	}
+}
+
+// TestRemoteStat_MissingArg returns 1.
+func TestRemoteStat_MissingArg(t *testing.T) {
+	prov := setup(t)
+	code := runRemoteCmd(prov, []string{"stat"})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+// TestRemoteMkdir_Success returns 0.
+func TestRemoteMkdir_Success(t *testing.T) {
+	prov := setup(t)
+	code := runRemoteCmd(prov, []string{"mkdir", "/newdir"})
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	_, err := prov.Stat(context.Background(), "/newdir")
+	if err != nil {
+		t.Fatalf("stat after mkdir: %v", err)
+	}
+}
+
+// TestRemoteMkdir_MissingArg returns 1.
+func TestRemoteMkdir_MissingArg(t *testing.T) {
+	prov := setup(t)
+	code := runRemoteCmd(prov, []string{"mkdir"})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+// TestRemoteUpload_Success returns 0 and persists the file.
+func TestRemoteUpload_Success(t *testing.T) {
+	prov := setup(t)
+	src, _ := os.CreateTemp(t.TempDir(), "upload-src-*")
+	src.WriteString("payload")
+	src.Close()
+
+	code := runRemoteCmd(prov, []string{"upload", src.Name(), "/dst.txt"})
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+
+	var buf bytes.Buffer
+	prov.Download(context.Background(), "/dst.txt", &buf)
+	if buf.String() != "payload" {
+		t.Errorf("data = %q, want %q", buf.String(), "payload")
+	}
+}
+
+// TestRemoteUpload_MissingArgs returns 1.
+func TestRemoteUpload_MissingArgs(t *testing.T) {
+	prov := setup(t)
+	code := runRemoteCmd(prov, []string{"upload", "/only-one"})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	code = runRemoteCmd(prov, []string{"upload"})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+// TestRemoteUpload_SourceNotFound returns non-zero.
+func TestRemoteUpload_SourceNotFound(t *testing.T) {
+	prov := setup(t)
+	code := runRemoteCmd(prov, []string{"upload", "/no/such/local", "/remote"})
+	if code == 0 {
+		t.Fatal("expected non-zero exit for missing local file")
+	}
+}
+
+// TestRemoteDownload_Success writes to stdout by default.
+func TestRemoteDownload_Success(t *testing.T) {
+	prov := setup(t)
+	prov.Upload(context.Background(), "/greet.txt",
+		strings.NewReader("hello"))
+
+	code := runRemoteCmd(prov, []string{"download", "/greet.txt"})
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+}
+
+// TestRemoteDownload_ToFile writes to the specified local file.
+func TestRemoteDownload_ToFile(t *testing.T) {
+	prov := setup(t)
+	prov.Upload(context.Background(), "/data.bin",
+		strings.NewReader("binary"))
+
+	dst := filepath.Join(t.TempDir(), "out.bin")
+	code := runRemoteCmd(prov, []string{"download", "/data.bin", dst})
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+
+	got, _ := os.ReadFile(dst)
+	if string(got) != "binary" {
+		t.Errorf("data = %q, want %q", got, "binary")
+	}
+}
+
+// TestRemoteDownload_MissingArg returns 1.
+func TestRemoteDownload_MissingArg(t *testing.T) {
+	prov := setup(t)
+	code := runRemoteCmd(prov, []string{"download"})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+// TestRemoteDownload_NotFound returns non-zero.
+func TestRemoteDownload_NotFound(t *testing.T) {
+	prov := setup(t)
+	code := runRemoteCmd(prov, []string{"download", "/nope.txt"})
+	if code == 0 {
+		t.Fatal("expected non-zero exit for missing remote file")
+	}
+}
+
+// TestRemoteMv_Success returns 0 and moves the entry.
+func TestRemoteMv_Success(t *testing.T) {
+	prov := setup(t)
+	prov.Upload(context.Background(), "/old.txt",
+		strings.NewReader("data"))
+
+	code := runRemoteCmd(prov, []string{"mv", "/old.txt", "/new.txt"})
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+
+	_, err := prov.Stat(context.Background(), "/old.txt")
+	if err == nil {
+		t.Error("old path should not exist")
+	}
+	var buf bytes.Buffer
+	prov.Download(context.Background(), "/new.txt", &buf)
+	if buf.String() != "data" {
+		t.Errorf("data = %q, want %q", buf.String(), "data")
+	}
+}
+
+// TestRemoteMv_MissingArgs returns 1.
+func TestRemoteMv_MissingArgs(t *testing.T) {
+	prov := setup(t)
+	code := runRemoteCmd(prov, []string{"mv", "/one"})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	code = runRemoteCmd(prov, []string{"mv"})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+// TestRemoteRm_Success returns 0 after removing a file.
+func TestRemoteRm_Success(t *testing.T) {
+	prov := setup(t)
+	prov.Upload(context.Background(), "/bye.txt",
+		strings.NewReader("x"))
+
+	code := runRemoteCmd(prov, []string{"rm", "/bye.txt"})
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	_, err := prov.Stat(context.Background(), "/bye.txt")
+	if err == nil {
+		t.Error("file should be removed")
+	}
+}
+
+// TestRemoteRm_MissingArg returns 1.
+func TestRemoteRm_MissingArg(t *testing.T) {
+	prov := setup(t)
+	code := runRemoteCmd(prov, []string{"rm"})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+// TestRemoteRm_NotFound returns non-zero.
+func TestRemoteRm_NotFound(t *testing.T) {
+	prov := setup(t)
+	code := runRemoteCmd(prov, []string{"rm", "/nothing"})
+	if code == 0 {
+		t.Fatal("expected non-zero exit for missing file")
+	}
+}
+
+// TestRemoteUnknownSubcommand returns 1.
+func TestRemoteUnknownSubcommand(t *testing.T) {
+	prov := setup(t)
+	code := runRemoteCmd(prov, []string{"bogus"})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+// TestRemoteChineseNames exercises non-ASCII paths through the CLI layer.
+func TestRemoteChineseNames(t *testing.T) {
+	prov := setup(t)
+	ctx := context.Background()
+	prov.Mkdir(ctx, "/目录")
+	prov.Upload(ctx, "/目录/文档.txt", strings.NewReader("content"))
+
+	code := runRemoteCmd(prov, []string{"ls", "/目录"})
+	if code != 0 {
+		t.Fatalf("ls exit code = %d, want 0", code)
+	}
+
+	code = runRemoteCmd(prov, []string{"stat", "/目录/文档.txt"})
+	if code != 0 {
+		t.Fatalf("stat exit code = %d, want 0", code)
+	}
+}

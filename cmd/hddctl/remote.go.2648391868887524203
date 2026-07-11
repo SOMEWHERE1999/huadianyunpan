@@ -1,0 +1,141 @@
+﻿package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"ncepupan/hdd/internal/cloud"
+)
+
+// cmdRemoteLs lists entries under a remote path.
+func cmdRemoteLs(prov cloud.Provider, args []string) error {
+	if len(args) != 1 {
+		return usageError("ls <path>")
+	}
+	entries, err := prov.List(context.Background(), args[0])
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		dir := ""
+		if e.IsDir {
+			dir = "/"
+		}
+		fmt.Printf("%s%s  %10d  %s\n", e.Path, dir, e.Size,
+			e.ModTime.Format(time.RFC3339))
+	}
+	return nil
+}
+
+// cmdRemoteStat shows metadata for a single remote path.
+func cmdRemoteStat(prov cloud.Provider, args []string) error {
+	if len(args) != 1 {
+		return usageError("stat <path>")
+	}
+	info, err := prov.Stat(context.Background(), args[0])
+	if err != nil {
+		return err
+	}
+	kind := "file"
+	if info.IsDir {
+		kind = "directory"
+	}
+	fmt.Printf("  path: %s\n", info.Path)
+	fmt.Printf("  type: %s\n", kind)
+	fmt.Printf("  size: %d\n", info.Size)
+	fmt.Printf("  time: %s\n", info.ModTime.Format(time.RFC3339))
+	return nil
+}
+
+// cmdRemoteMkdir creates a directory.
+func cmdRemoteMkdir(prov cloud.Provider, args []string) error {
+	if len(args) != 1 {
+		return usageError("mkdir <path>")
+	}
+	return prov.Mkdir(context.Background(), args[0])
+}
+
+// cmdRemoteUpload uploads a local file to a remote path.
+func cmdRemoteUpload(prov cloud.Provider, args []string) error {
+	if len(args) != 2 {
+		return usageError("upload <local-path> <remote-path>")
+	}
+	src := args[0]
+	dst := args[1]
+
+	f, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open local file: %w", err)
+	}
+	defer f.Close()
+
+	return prov.Upload(context.Background(), dst, f)
+}
+
+// cmdRemoteDownload downloads a remote file.
+// If dst is "-" or empty and there are exactly 2 positional args,
+// writes to stdout.  Otherwise dst is a local file path.
+func cmdRemoteDownload(prov cloud.Provider, args []string) error {
+	if len(args) < 1 || len(args) > 2 {
+		return usageError("download <remote-path> [local-path]")
+	}
+	src := args[0]
+	dst := ""
+	if len(args) == 2 {
+		dst = args[1]
+	}
+
+	var w io.Writer = os.Stdout
+	var closer io.Closer
+	if dst != "" && dst != "-" {
+		f, err := os.Create(dst)
+		if err != nil {
+			return fmt.Errorf("create local file: %w", err)
+		}
+		w = f
+		closer = f
+	} else if dst == "" {
+		// Default to basename.
+		base := filepath.Base(strings.ReplaceAll(src, "/", string(os.PathSeparator)))
+		f, err := os.Create(base)
+		if err != nil {
+			return fmt.Errorf("create local file: %w", err)
+		}
+		w = f
+		closer = f
+	}
+	if closer != nil {
+		defer closer.Close()
+	}
+
+	return prov.Download(context.Background(), src, w)
+}
+
+// cmdRemoteMv renames or moves a remote entry.
+func cmdRemoteMv(prov cloud.Provider, args []string) error {
+	if len(args) != 2 {
+		return usageError("mv <src> <dst>")
+	}
+	return prov.Rename(context.Background(), args[0], args[1])
+}
+
+// cmdRemoteRm removes a remote file or empty directory.
+func cmdRemoteRm(prov cloud.Provider, args []string) error {
+	if len(args) != 1 {
+		return usageError("rm <path>")
+	}
+	return prov.Remove(context.Background(), args[0])
+}
+
+// errUsage is a sentinel for usage errors.
+var errUsage = errors.New("usage")
+
+func usageError(format string, a ...any) error {
+	return fmt.Errorf("usage: "+format, a...)
+}

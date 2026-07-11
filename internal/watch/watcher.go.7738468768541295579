@@ -1,0 +1,148 @@
+﻿// Package watch provides poll-based directory monitoring with debouncing.
+package watch
+
+import (
+	"context"
+	"io/fs"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"ncepupan/hdd/internal/store/sqlite"
+)
+
+const (
+	DefaultPollInterval = 2 * time.Second
+	DefaultDebounce     = 500 * time.Millisecond
+)
+
+// Watcher polls directories and emits file changes after debouncing.
+type Watcher struct {
+	store       *sqlite.Store
+	roots       []syncRoot
+	taskFn      TaskFunc
+
+	poll     time.Duration
+	debounce time.Duration
+
+	mu         sync.Mutex
+	lastSeen   map[string]time.Time // path -> last mod time seen
+	pending    map[string]time.Time // path -> earliest change time (for debounce)
+
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+type syncRoot struct {
+	LocalPath  string
+	RemotePath string
+}
+
+// TaskFunc is called for each file that should be uploaded.
+type TaskFunc func(localPath, remotePath string)
+
+// New creates a Watcher.
+func New(store *sqlite.Store, taskFn TaskFunc) *Watcher {
+	return &Watcher{
+		store:    store,
+		taskFn:   taskFn,
+		poll:     DefaultPollInterval,
+		debounce: DefaultDebounce,
+		lastSeen: make(map[string]time.Time),
+		pending:  make(map[string]time.Time),
+	}
+}
+
+// SetPollInterval overrides the poll interval (for tests).
+func (w *Watcher) SetPollInterval(d time.Duration) { w.poll = d }
+
+// SetDebounce overrides the debounce window (for tests).
+func (w *Watcher) SetDebounce(d time.Duration) { w.debounce = d }
+
+// AddRoot adds a directory to watch.
+func (w *Watcher) AddRoot(localPath, remotePath string) {
+	w.roots = append(w.roots, syncRoot{
+		LocalPath:  localPath,
+		RemotePath: remotePath,
+	})
+}
+
+// Start begins polling.  Blocks until ctx is cancelled.
+func (w *Watcher) Start(ctx context.Context) {
+	w.ctx, w.cancel = context.WithCancel(ctx)
+	defer w.cancel()
+
+	ticker := time.NewTicker(w.poll)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case <-ticker.C:
+			w.scan()
+		}
+	}
+}
+
+// Stop cancels the watcher context.
+func (w *Watcher) Stop() {
+	if w.cancel != nil {
+		w.cancel()
+	}
+}
+
+// scan walks all roots and detects changes.
+func (w *Watcher) scan() {
+	now := time.Now()
+
+	for _, root := range w.roots {
+		filepath.WalkDir(root.LocalPath, func(localPath string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
+
+			modTime := info.ModTime()
+			w.mu.Lock()
+			prev, seen := w.lastSeen[localPath]
+			if !seen || modTime.After(prev) {
+				// New or modified: record and add to pending.
+				w.lastSeen[localPath] = modTime
+				if _, ok := w.pending[localPath]; !ok {
+					w.pending[localPath] = now
+				}
+			}
+
+			// Check if any pending file has been stable long enough.
+			for path, since := range w.pending {
+				if now.Sub(since) >= w.debounce {
+					// Stable: emit task.
+					remotePath := w.remotePathFor(root, path)
+					slog.Info("watch: file changed", "local", path, "remote", remotePath)
+					if w.taskFn != nil {
+						w.taskFn(path, remotePath)
+					}
+					delete(w.pending, path)
+				}
+			}
+			w.mu.Unlock()
+
+			return nil
+		})
+	}
+}
+
+func (w *Watcher) remotePathFor(root syncRoot, localPath string) string {
+	rel, err := filepath.Rel(root.LocalPath, localPath)
+	if err != nil {
+		return filepath.ToSlash(localPath)
+	}
+	return filepath.ToSlash(filepath.Join(root.RemotePath, rel))
+}

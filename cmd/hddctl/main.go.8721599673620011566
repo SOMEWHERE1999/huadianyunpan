@@ -1,0 +1,37 @@
+﻿// hddctl is the command-line client for the Huadian Drive cloud storage service.
+package main
+
+import (
+	"flag"
+	"os"
+
+	"ncepupan/hdd/internal/app"
+)
+
+func main() {
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		out.Write([]byte("Usage: hddctl [command]\n\n"))
+		out.Write([]byte("Commands:\n"))
+		out.Write([]byte("  version   Print version information\n"))
+		out.Write([]byte("  help      Print this help message\n"))
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	args := flag.Args()
+	cmd := "help"
+	if len(args) > 0 {
+		cmd = args[0]
+	}
+
+	switch cmd {
+	case "version":
+		app.PrintVersion("hddctl")
+	case "help", "-h", "--help":
+		flag.Usage()
+	default:
+		flag.Usage()
+		os.Exit(1)
+	}
+}

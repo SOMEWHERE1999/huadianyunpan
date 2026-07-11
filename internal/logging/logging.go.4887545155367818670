@@ -1,0 +1,42 @@
+﻿// Package logging provides structured logging utilities.
+package logging
+
+import (
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+)
+
+// Setup configures the default slog logger.
+// If logFile is empty, logs go to stderr.
+func Setup(logFile, level string) error {
+	var lvl slog.Level
+	switch level {
+	case "debug":
+		lvl = slog.LevelDebug
+	case "warn":
+		lvl = slog.LevelWarn
+	case "error":
+		lvl = slog.LevelError
+	default:
+		lvl = slog.LevelInfo
+	}
+
+	var w io.Writer = os.Stderr
+	if logFile != "" {
+		dir := filepath.Dir(logFile)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return err
+		}
+		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			return err
+		}
+		w = f
+	}
+
+	handler := slog.NewTextHandler(w, &slog.HandlerOptions{Level: lvl})
+	slog.SetDefault(slog.New(handler))
+	return nil
+}

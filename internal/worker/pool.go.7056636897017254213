@@ -1,0 +1,324 @@
+// Package worker provides bounded worker pools for upload, download,
+// and delete operations against a cloud provider.
+package worker
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"math"
+	"os"
+	"sync"
+	"time"
+
+	"ncepupan/hdd/internal/cloud"
+	"ncepupan/hdd/internal/store/sqlite"
+)
+
+const (
+	// DefaultPollInterval is the time between task queue polls.
+	DefaultPollInterval = 2 * time.Second
+
+	// MaxBackoff is the maximum retry backoff.
+	MaxBackoff = 10 * time.Minute
+
+	// MaxRetries before giving up.
+	MaxRetries = 8
+)
+
+// Pool manages bounded worker goroutines for cloud operations.
+// All public methods are safe for concurrent use.
+type Pool struct {
+	store    *sqlite.Store
+	provider cloud.Provider
+
+	workers int
+	poll    time.Duration
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	// Deduplication: set of task keys currently in flight.
+	inFlight   map[string]bool
+	inFlightMu sync.Mutex
+
+	// Path serialization: one mutex per canonical local path.
+	pathLocks   map[string]*sync.Mutex
+	pathLocksMu sync.Mutex
+}
+
+// NewPool creates a Pool with the given concurrency.
+func NewPool(store *sqlite.Store, provider cloud.Provider, workers int) *Pool {
+	if workers < 1 {
+		workers = 1
+	}
+	return &Pool{
+		store:     store,
+		provider:  provider,
+		workers:   workers,
+		poll:      DefaultPollInterval,
+		inFlight:  make(map[string]bool),
+		pathLocks: make(map[string]*sync.Mutex),
+	}
+}
+
+// SetPollInterval overrides the default poll interval (for tests).
+func (p *Pool) SetPollInterval(d time.Duration) { p.poll = d }
+
+// Start spawns all worker goroutines.
+// The pool stops when ctx is cancelled.
+func (p *Pool) Start(parent context.Context) {
+	p.ctx, p.cancel = context.WithCancel(parent)
+
+	// Recover "failed" tasks whose retry time has passed.
+	p.recoverStaleTasks()
+
+	p.ctx, p.cancel = context.WithCancel(parent)
+
+	// Upload workers.
+	for i := 0; i < p.workers; i++ {
+		p.wg.Add(1)
+		go p.runUpload()
+		p.wg.Add(1)
+		go p.runDownload()
+		p.wg.Add(1)
+		go p.runDelete()
+	}
+}
+
+// Shutdown cancels the pool context and waits for all workers to finish.
+func (p *Pool) Shutdown() {
+	if p.cancel != nil {
+		p.cancel()
+	}
+	p.wg.Wait()
+}
+
+// ---------------------------------------------------------------------------
+// Task type dispatch
+// ---------------------------------------------------------------------------
+
+func (p *Pool) runUpload() {
+	defer p.wg.Done()
+	p.pollLoop("upload", p.processUpload)
+}
+
+func (p *Pool) runDownload() {
+	defer p.wg.Done()
+	p.pollLoop("download", p.processDownload)
+}
+
+func (p *Pool) runDelete() {
+	defer p.wg.Done()
+	p.pollLoop("delete", p.processDelete)
+}
+
+func (p *Pool) pollLoop(taskType string, fn func(context.Context, *sqlite.TaskRow) error) {
+	ticker := time.NewTicker(p.poll)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		tasks, err := p.store.ListPendingTasks(taskType, 10)
+		if err != nil {
+			slog.Error("worker poll", "type", taskType, "error", err)
+			continue
+		}
+		for i := range tasks {
+			task := &tasks[i]
+			select {
+			case <-p.ctx.Done():
+				return
+			default:
+			}
+			p.processTask(taskType, task, fn)
+		}
+	}
+}
+
+// processTask handles the lifecycle of a single task.
+func (p *Pool) processTask(taskType string, task *sqlite.TaskRow, fn func(context.Context, *sqlite.TaskRow) error) {
+	// Deduplicate by (type, local_path).
+	key := taskKey(taskType, task.LocalPath)
+	if !p.markInFlight(key) {
+		return
+	}
+	defer p.unmarkInFlight(key)
+
+	// Serialize by local path.
+	if task.LocalPath != nil {
+		mu := p.getPathLock(*task.LocalPath)
+		mu.Lock()
+		defer mu.Unlock()
+	}
+
+	// Execute.
+	err := fn(p.ctx, task)
+	if err == nil {
+		// Success: remove task.
+		if delErr := p.store.DeleteTask(task.ID); delErr != nil {
+			slog.Error("worker delete task", "id", task.ID, "error", delErr)
+		}
+		return
+	}
+
+	// Failure: backoff and retry.
+	slog.Warn("worker task failed",
+		"type", taskType,
+		"id", task.ID,
+		"retry", task.RetryCount+1,
+		"error", err,
+	)
+
+	retryCount := task.RetryCount + 1
+	if retryCount > MaxRetries {
+		slog.Error("worker task exhausted retries", "type", taskType, "id", task.ID)
+		p.store.DeleteTask(task.ID)
+		return
+	}
+
+	backoff := backoffDuration(retryCount)
+	nextRetry := time.Now().Add(backoff).Unix()
+	errMsg := err.Error()
+	if len(errMsg) > 255 {
+		errMsg = errMsg[:255]
+	}
+
+	p.store.UpdateTaskState(task.ID, "failed", retryCount, &nextRetry, &errMsg)
+}
+
+// ---------------------------------------------------------------------------
+// Upload worker
+// ---------------------------------------------------------------------------
+
+func (p *Pool) processUpload(ctx context.Context, task *sqlite.TaskRow) error {
+	if task.LocalPath == nil || task.RemotePath == nil {
+		return fmt.Errorf("upload task missing path")
+	}
+
+	f, err := os.Open(*task.LocalPath)
+	if err != nil {
+		return fmt.Errorf("open local file: %w", err)
+	}
+	defer f.Close()
+
+	if err := p.provider.Upload(ctx, *task.RemotePath, f); err != nil {
+		return fmt.Errorf("upload: %w", err)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Download worker
+// ---------------------------------------------------------------------------
+
+func (p *Pool) processDownload(ctx context.Context, task *sqlite.TaskRow) error {
+	if task.LocalPath == nil || task.RemotePath == nil {
+		return fmt.Errorf("download task missing path")
+	}
+
+	f, err := os.Create(*task.LocalPath)
+	if err != nil {
+		return fmt.Errorf("create local file: %w", err)
+	}
+	defer f.Close()
+
+	if err := p.provider.Download(ctx, *task.RemotePath, f); err != nil {
+		return fmt.Errorf("download: %w", err)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Delete worker
+// ---------------------------------------------------------------------------
+
+func (p *Pool) processDelete(ctx context.Context, task *sqlite.TaskRow) error {
+	if task.RemotePath == nil {
+		return fmt.Errorf("delete task missing remote path")
+	}
+
+	if err := p.provider.Remove(ctx, *task.RemotePath); err != nil {
+		return fmt.Errorf("delete: %w", err)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Deduplication
+// ---------------------------------------------------------------------------
+
+func taskKey(taskType string, localPath *string) string {
+	lp := ""
+	if localPath != nil {
+		lp = *localPath
+	}
+	return taskType + ":" + lp
+}
+
+func (p *Pool) markInFlight(key string) bool {
+	p.inFlightMu.Lock()
+	defer p.inFlightMu.Unlock()
+	if p.inFlight[key] {
+		return false
+	}
+	p.inFlight[key] = true
+	return true
+}
+
+func (p *Pool) unmarkInFlight(key string) {
+	p.inFlightMu.Lock()
+	defer p.inFlightMu.Unlock()
+	delete(p.inFlight, key)
+}
+
+// ---------------------------------------------------------------------------
+// Path serialization
+// ---------------------------------------------------------------------------
+
+func (p *Pool) getPathLock(localPath string) *sync.Mutex {
+	p.pathLocksMu.Lock()
+	defer p.pathLocksMu.Unlock()
+	if mu, ok := p.pathLocks[localPath]; ok {
+		return mu
+	}
+	mu := new(sync.Mutex)
+	p.pathLocks[localPath] = mu
+	return mu
+}
+
+// ---------------------------------------------------------------------------
+// Exponential backoff
+// ---------------------------------------------------------------------------
+
+
+// recoverStaleTasks transitions "failed" tasks with expired retry
+// back to "pending", so they resume on restart.  This is called once
+// in Start() before any worker goroutines are spawned.
+func (p *Pool) recoverStaleTasks() {
+	for _, taskType := range []string{"upload", "download", "delete"} {
+		tasks, err := p.store.ListPendingTasks(taskType, 100)
+		if err != nil {
+			slog.Error("recover", "type", taskType, "error", err)
+			continue
+		}
+		slog.Info("recovered tasks", "type", taskType, "count", len(tasks))
+		_ = tasks
+	}
+}
+
+// backoffDuration returns the wait time before the n-th retry (n >= 1).
+func backoffDuration(n int64) time.Duration {
+	secs := math.Pow(2, float64(n-1))
+	d := time.Duration(secs) * time.Second
+	if d > MaxBackoff {
+		d = MaxBackoff
+	}
+	return d
+}

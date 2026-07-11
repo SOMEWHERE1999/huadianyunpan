@@ -1,0 +1,119 @@
+﻿// hddctl is the command-line client for the Huadian Drive cloud storage service.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"ncepupan/hdd/internal/app"
+	"ncepupan/hdd/internal/cloud"
+	"ncepupan/hdd/internal/cloud/mock"
+)
+
+func main() {
+	flag.Usage = printUsage
+	flag.Parse()
+
+	args := flag.Args()
+	if len(args) == 0 {
+		printUsage()
+		os.Exit(1)
+	}
+
+	cmd := args[0]
+	switch cmd {
+	case "version", "-V", "--version":
+		app.PrintVersion("hddctl")
+	case "help", "-h", "--help":
+		printUsage()
+	case "remote":
+		os.Exit(runRemote(args[1:]))
+	default:
+		fmt.Fprintf(os.Stderr, "hddctl: unknown command %q\n", cmd)
+		printUsage()
+		os.Exit(1)
+	}
+}
+
+func printUsage() {
+	out := flag.CommandLine.Output()
+	out.Write([]byte("Usage: hddctl [command]\n\n"))
+	out.Write([]byte("Commands:\n"))
+	out.Write([]byte("  version              Print version information\n"))
+	out.Write([]byte("  help                 Print this help message\n"))
+	out.Write([]byte("  remote <cmd> [args]  Operate on the remote cloud storage\n"))
+	out.Write([]byte("\nRemote commands:\n"))
+	out.Write([]byte("  remote ls <path>              List entries under path\n"))
+	out.Write([]byte("  remote stat <path>            Show file metadata\n"))
+	out.Write([]byte("  remote mkdir <path>           Create directory\n"))
+	out.Write([]byte("  remote upload <local> <path>  Upload a local file\n"))
+	out.Write([]byte("  remote download <path> [dst]  Download a remote file\n"))
+	out.Write([]byte("  remote mv <src> <dst>         Rename or move\n"))
+	out.Write([]byte("  remote rm <path>              Remove a file or empty dir\n"))
+}
+
+// mockRootDir returns a persistent directory for the mock provider
+// so that state survives across CLI invocations.
+func mockRootDir() string {
+	base := os.Getenv("LOCALAPPDATA")
+	if base == "" {
+		base = os.TempDir()
+	}
+	dir := filepath.Join(base, "hdd", "mock-root")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		fmt.Fprintf(os.Stderr, "hddctl: create mock dir: %v\n", err)
+		os.Exit(2)
+	}
+	return dir
+}
+
+func runRemote(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "hddctl remote: missing subcommand")
+		return 1
+	}
+
+	prov := mock.New(mockRootDir())
+	_ = prov.Mkdir(context.Background(), "/")
+
+	return runRemoteCmd(prov, args)
+}
+
+func runRemoteCmd(prov cloud.Provider, args []string) int {
+	subcmd := args[0]
+	rest := args[1:]
+
+	switch subcmd {
+	case "ls":
+		return exitCode(cmdRemoteLs(prov, rest))
+	case "stat":
+		return exitCode(cmdRemoteStat(prov, rest))
+	case "mkdir":
+		return exitCode(cmdRemoteMkdir(prov, rest))
+	case "upload":
+		return exitCode(cmdRemoteUpload(prov, rest))
+	case "download":
+		return exitCode(cmdRemoteDownload(prov, rest))
+	case "mv":
+		return exitCode(cmdRemoteMv(prov, rest))
+	case "rm":
+		return exitCode(cmdRemoteRm(prov, rest))
+	default:
+		fmt.Fprintf(os.Stderr, "hddctl remote: unknown subcommand %q\n", subcmd)
+		return 1
+	}
+}
+
+func exitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	msg := err.Error()
+	if len(msg) >= 6 && msg[:6] == "usage:" {
+		return 1
+	}
+	return 2
+}

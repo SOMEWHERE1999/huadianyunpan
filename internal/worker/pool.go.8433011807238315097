@@ -1,0 +1,268 @@
+﻿package worker
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"math"
+	"os"
+	"sync"
+	"time"
+
+	"ncepupan/hdd/internal/cloud"
+	"ncepupan/hdd/internal/filter"
+	"ncepupan/hdd/internal/store/sqlite"
+)
+
+const (
+	DefaultPollInterval = 2 * time.Second
+	MaxBackoff          = 10 * time.Minute
+	MaxRetries          = 8
+)
+
+type Pool struct {
+	store    *sqlite.Store
+	provider cloud.Provider
+	filter   *filter.Filter
+
+	workers int
+	poll    time.Duration
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	inFlight   map[string]bool
+	inFlightMu sync.Mutex
+
+	pathLocks   map[string]*sync.Mutex
+	pathLocksMu sync.Mutex
+}
+
+func NewPool(store *sqlite.Store, provider cloud.Provider, workers int, f *filter.Filter) *Pool {
+	if workers < 1 {
+		workers = 1
+	}
+	if f == nil {
+		f = filter.New(nil)
+	}
+	return &Pool{
+		store:     store,
+		provider:  provider,
+		filter:    f,
+		workers:   workers,
+		poll:      DefaultPollInterval,
+		inFlight:  make(map[string]bool),
+		pathLocks: make(map[string]*sync.Mutex),
+	}
+}
+
+func (p *Pool) SetPollInterval(d time.Duration) { p.poll = d }
+
+func (p *Pool) Start(parent context.Context) {
+	p.ctx, p.cancel = context.WithCancel(parent)
+	p.recoverStaleTasks()
+
+	for i := 0; i < p.workers; i++ {
+		p.wg.Add(1)
+		go p.runUpload()
+		p.wg.Add(1)
+		go p.runDownload()
+		p.wg.Add(1)
+		go p.runDelete()
+	}
+}
+
+func (p *Pool) Shutdown() {
+	if p.cancel != nil {
+		p.cancel()
+	}
+	p.wg.Wait()
+}
+
+func (p *Pool) runUpload() {
+	defer p.wg.Done()
+	p.pollLoop("upload", p.processUpload)
+}
+
+func (p *Pool) runDownload() {
+	defer p.wg.Done()
+	p.pollLoop("download", p.processDownload)
+}
+
+func (p *Pool) runDelete() {
+	defer p.wg.Done()
+	p.pollLoop("delete", p.processDelete)
+}
+
+func (p *Pool) pollLoop(taskType string, fn func(context.Context, *sqlite.TaskRow) error) {
+	ticker := time.NewTicker(p.poll)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		tasks, err := p.store.ListPendingTasks(taskType, 10)
+		if err != nil {
+			slog.Error("worker poll", "type", taskType, "error", err)
+			continue
+		}
+		for i := range tasks {
+			task := &tasks[i]
+			select {
+			case <-p.ctx.Done():
+				return
+			default:
+			}
+			p.processTask(taskType, task, fn)
+		}
+	}
+}
+
+func (p *Pool) processTask(taskType string, task *sqlite.TaskRow, fn func(context.Context, *sqlite.TaskRow) error) {
+	key := taskKey(taskType, task.LocalPath)
+	if !p.markInFlight(key) {
+		return
+	}
+	defer p.unmarkInFlight(key)
+
+	if task.LocalPath != nil {
+		mu := p.getPathLock(*task.LocalPath)
+		mu.Lock()
+		defer mu.Unlock()
+	}
+
+	// Filter check before execution.
+	if task.LocalPath != nil && p.filter.ExcludePath(*task.LocalPath) {
+		slog.Debug("worker task filtered out", "id", task.ID, "path", *task.LocalPath)
+		p.store.DeleteTask(task.ID)
+		return
+	}
+
+	err := fn(p.ctx, task)
+	if err == nil {
+		if delErr := p.store.DeleteTask(task.ID); delErr != nil {
+			slog.Error("worker delete task", "id", task.ID, "error", delErr)
+		}
+		return
+	}
+
+	slog.Warn("worker task failed",
+		"type", taskType, "id", task.ID, "retry", task.RetryCount+1, "error", err,
+	)
+
+	retryCount := task.RetryCount + 1
+	if retryCount > MaxRetries {
+		slog.Error("worker task exhausted retries", "type", taskType, "id", task.ID)
+		p.store.DeleteTask(task.ID)
+		return
+	}
+
+	backoff := backoffDuration(retryCount)
+	nextRetry := time.Now().Add(backoff).Unix()
+	errMsg := err.Error()
+	if len(errMsg) > 255 {
+		errMsg = errMsg[:255]
+	}
+	p.store.UpdateTaskState(task.ID, "failed", retryCount, &nextRetry, &errMsg)
+}
+
+func (p *Pool) processUpload(ctx context.Context, task *sqlite.TaskRow) error {
+	if task.LocalPath == nil || task.RemotePath == nil {
+		return fmt.Errorf("upload task missing path")
+	}
+	f, err := os.Open(*task.LocalPath)
+	if err != nil {
+		return fmt.Errorf("open local file: %w", err)
+	}
+	defer f.Close()
+	if err := p.provider.Upload(ctx, *task.RemotePath, f); err != nil {
+		return fmt.Errorf("upload: %w", err)
+	}
+	return nil
+}
+
+func (p *Pool) processDownload(ctx context.Context, task *sqlite.TaskRow) error {
+	if task.LocalPath == nil || task.RemotePath == nil {
+		return fmt.Errorf("download task missing path")
+	}
+	f, err := os.Create(*task.LocalPath)
+	if err != nil {
+		return fmt.Errorf("create local file: %w", err)
+	}
+	defer f.Close()
+	if err := p.provider.Download(ctx, *task.RemotePath, f); err != nil {
+		return fmt.Errorf("download: %w", err)
+	}
+	return nil
+}
+
+func (p *Pool) processDelete(ctx context.Context, task *sqlite.TaskRow) error {
+	if task.RemotePath == nil {
+		return fmt.Errorf("delete task missing remote path")
+	}
+	if err := p.provider.Remove(ctx, *task.RemotePath); err != nil {
+		return fmt.Errorf("delete: %w", err)
+	}
+	return nil
+}
+
+func taskKey(taskType string, localPath *string) string {
+	lp := ""
+	if localPath != nil {
+		lp = *localPath
+	}
+	return taskType + ":" + lp
+}
+
+func (p *Pool) markInFlight(key string) bool {
+	p.inFlightMu.Lock()
+	defer p.inFlightMu.Unlock()
+	if p.inFlight[key] {
+		return false
+	}
+	p.inFlight[key] = true
+	return true
+}
+
+func (p *Pool) unmarkInFlight(key string) {
+	p.inFlightMu.Lock()
+	defer p.inFlightMu.Unlock()
+	delete(p.inFlight, key)
+}
+
+func (p *Pool) getPathLock(localPath string) *sync.Mutex {
+	p.pathLocksMu.Lock()
+	defer p.pathLocksMu.Unlock()
+	if mu, ok := p.pathLocks[localPath]; ok {
+		return mu
+	}
+	mu := new(sync.Mutex)
+	p.pathLocks[localPath] = mu
+	return mu
+}
+
+func (p *Pool) recoverStaleTasks() {
+	for _, taskType := range []string{"upload", "download", "delete"} {
+		tasks, err := p.store.ListPendingTasks(taskType, 100)
+		if err != nil {
+			slog.Error("recover", "type", taskType, "error", err)
+			continue
+		}
+		slog.Info("recovered tasks", "type", taskType, "count", len(tasks))
+		_ = tasks
+	}
+}
+
+func backoffDuration(n int64) time.Duration {
+	secs := math.Pow(2, float64(n-1))
+	d := time.Duration(secs) * time.Second
+	if d > MaxBackoff {
+		d = MaxBackoff
+	}
+	return d
+}

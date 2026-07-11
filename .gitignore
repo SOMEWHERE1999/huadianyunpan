@@ -1,0 +1,43 @@
+﻿# Git ignore rules for Huadian Drive.
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+# Test binary, built with `go test -c`
+*.test
+# Output of go coverage
+*.out
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+# OS
+Thumbs.db
+# Runtime data (never commit)
+*.db
+*.db-journal
+*.db-wal
+*.log
+# Tokens / secrets
+*.token
+token.json
+credentials.json
+
+# Test download artifacts
+.testdownload/
+*.hdddl-*
+cmd/hddctl/.testdownload/
+cmd/hddctl/downloaded.md
+downloaded.md
+
+# CDP browser temp files
+cdp_backup.diff
+
+# Upload test files
+test_upload.txt
+cmd/hddctl/greet.txt
+cmd/hddctl/nope.txt

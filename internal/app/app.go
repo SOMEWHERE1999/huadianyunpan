@@ -1,0 +1,34 @@
+// Package app provides application bootstrap utilities.
+package app
+
+import (
+	"log/slog"
+	"os"
+)
+
+// Version is the application version, set at build time.
+var Version = "0.1.0-dev"
+
+// PrintVersion writes the version to stdout.
+func PrintVersion(name string) {
+	os.Stdout.WriteString(name + " version " + Version + "\n")
+}
+
+// SetupLogging initializes logging from config.
+func SetupLogging(level string) error {
+	var lvl slog.Level
+	switch level {
+	case "debug":
+		lvl = slog.LevelDebug
+	case "warn":
+		lvl = slog.LevelWarn
+	case "error":
+		lvl = slog.LevelError
+	default:
+		lvl = slog.LevelInfo
+	}
+
+	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
+	slog.SetDefault(slog.New(handler))
+	return nil
+}

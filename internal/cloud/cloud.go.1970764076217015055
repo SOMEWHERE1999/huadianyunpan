@@ -1,0 +1,36 @@
+﻿// Package cloud defines the Provider interface for cloud storage backends.
+package cloud
+
+import (
+	"context"
+	"io"
+
+	"ncepupan/hdd/internal/domain"
+)
+
+// Provider is the interface that every cloud backend must implement.
+type Provider interface {
+	// Name returns the provider name (e.g. "huadian", "mock").
+	Name() string
+
+	// Connect authenticates and establishes a session.
+	Connect(ctx context.Context) error
+
+	// Disconnect tears down the session.
+	Disconnect(ctx context.Context) error
+
+	// ListFiles returns file metadata for the given remote directory.
+	ListFiles(ctx context.Context, remotePath string) ([]domain.FileInfo, error)
+
+	// Download retrieves a remote file and writes its content to w.
+	Download(ctx context.Context, remotePath string, w io.Writer) error
+
+	// Upload reads from r and stores it at remotePath.
+	Upload(ctx context.Context, remotePath string, r io.Reader, size int64) error
+
+	// Delete removes a remote file.
+	Delete(ctx context.Context, remotePath string) error
+
+	// Move renames or moves a remote file.
+	Move(ctx context.Context, oldPath, newPath string) error
+}

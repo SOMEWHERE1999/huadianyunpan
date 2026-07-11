@@ -1,0 +1,104 @@
+﻿// hddsyncd is the background synchronization daemon for the Huadian Drive
+// cloud storage service. It watches configured directories and keeps them
+// synchronized with the cloud provider.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"time"
+
+	"ncepupan/hdd/internal/app"
+	"ncepupan/hdd/internal/cloud/mock"
+	"ncepupan/hdd/internal/domain"
+)
+
+func main() {
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		out.Write([]byte("Usage: hddsyncd [command]\n\n"))
+		out.Write([]byte("Commands:\n"))
+		out.Write([]byte("  version   Print version information\n"))
+		out.Write([]byte("  run       Start the synchronization daemon\n"))
+		out.Write([]byte("  help      Print this help message\n"))
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	args := flag.Args()
+	cmd := "help"
+	if len(args) > 0 {
+		cmd = args[0]
+	}
+
+	switch cmd {
+	case "version":
+		app.PrintVersion("hddsyncd")
+	case "run":
+		runDaemon()
+	case "help", "-h", "--help":
+		flag.Usage()
+	default:
+		fmt.Fprintf(os.Stderr, "hddsyncd: unknown command %q\n", cmd)
+		flag.Usage()
+		os.Exit(1)
+	}
+}
+
+func runDaemon() {
+	// Use a mock provider until the real backend is implemented.
+	prov := mock.New()
+	prov.PutFile("test/hello.txt", []byte("hello world"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Trap Ctrl+C for graceful shutdown.
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt)
+	defer signal.Stop(ch)
+
+	slog.Info("hddsyncd starting", "provider", prov.Name())
+
+	// Quick smoke test: list mock files.
+	entries, err := prov.ListFiles(ctx, "/")
+	if err != nil {
+		slog.Error("list files failed", "error", err)
+	} else {
+		for _, e := range entries {
+			slog.Info("found remote file", "path", e.Path, "size", e.Size)
+		}
+	}
+
+	// Simulated sync root.
+	root := domain.SyncRoot{LocalPath: ".", RemotePath: "/"}
+	slog.Info("sync root registered", "local", root.LocalPath, "remote", root.RemotePath)
+
+	// Simple periodic poll loop.
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	slog.Info("hddsyncd ready (mock mode)")
+
+	for {
+		select {
+		case <-ch:
+			slog.Info("shutting down")
+			return
+		case <-ticker.C:
+			entries, err := prov.ListFiles(ctx, "/")
+			if err != nil {
+				slog.Error("poll error", "error", err)
+				continue
+			}
+			slog.Debug("poll ok", "count", len(entries))
+		case <-ctx.Done():
+			slog.Info("context canceled, exiting")
+			return
+		}
+	}
+}

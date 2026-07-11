@@ -1,0 +1,9 @@
+{
+  "provider": "huadian",
+  "mount": "S:",
+  "pipe": "\\\\.\\pipe\\huadian-drive-release",
+  "data_dir": "./data",
+  "log_dir": "./logs",
+  "mode": "mkdir-rename-move-file-rename-move-remove-copy-upload-only",
+  "debug_log": "./logs/hddfs.debug.log"
+}

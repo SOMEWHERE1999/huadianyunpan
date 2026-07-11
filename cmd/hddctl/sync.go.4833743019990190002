@@ -1,0 +1,125 @@
+﻿package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"time"
+
+	"ncepupan/hdd/internal/cloud/mock"
+	"ncepupan/hdd/internal/store/sqlite"
+	"ncepupan/hdd/internal/watch"
+	"ncepupan/hdd/internal/worker"
+)
+
+// cmdSyncAdd registers a sync root.
+func cmdSyncAdd(args []string) error {
+	if len(args) != 2 {
+		return usageError("sync add <local-dir> <remote-path>")
+	}
+	localPath, _ := filepath.Abs(args[0])
+	remotePath := args[1]
+
+	store, err := openSyncStore()
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	id, err := store.InsertSyncRoot(localPath, remotePath)
+	if err != nil {
+		return fmt.Errorf("add sync root: %w", err)
+	}
+	fmt.Printf("sync root added: id=%d local=%s remote=%s\n", id, localPath, remotePath)
+	return nil
+}
+
+// cmdSyncRun starts watching and syncing.
+func cmdSyncRun(args []string) error {
+	store, err := openSyncStore()
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	prov := mock.New(mockRootDir())
+	_ = prov.Mkdir(context.Background(), "/")
+
+	// Load sync roots.
+	roots, err := store.ListSyncRoots()
+	if err != nil {
+		return fmt.Errorf("list sync roots: %w", err)
+	}
+	if len(roots) == 0 {
+		return fmt.Errorf("no sync roots configured; use 'hddctl sync add' first")
+	}
+
+	// Start worker pool.
+	pool := worker.NewPool(store, prov, 1, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Trap Ctrl+C.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+
+	// Start watcher.
+	w := watch.New(store, func(localPath, remotePath string) {
+		fmt.Printf("[watch] changed: %s -> %s\n", localPath, remotePath)
+		store.InsertTask("upload", localPath, remotePath)
+	})
+	for _, r := range roots {
+		w.AddRoot(r.LocalPath, r.RemotePath)
+	}
+
+	go pool.Start(ctx)
+	go w.Start(ctx)
+
+	fmt.Println("sync running (Ctrl+C to stop)")
+	<-sigCh
+	fmt.Println("\nshutting down...")
+
+	cancel()
+	pool.Shutdown()
+	w.Stop()
+
+	return nil
+}
+
+// cmdSyncStatus shows sync state.
+func cmdSyncStatus(args []string) error {
+	store, err := openSyncStore()
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	roots, _ := store.ListSyncRoots()
+	fmt.Printf("sync roots: %d\n", len(roots))
+	for _, r := range roots {
+		status := "disabled"
+		if r.Enabled {
+			status = "enabled"
+		}
+		fmt.Printf("  [%s] %s -> %s\n", status, r.LocalPath, r.RemotePath)
+	}
+
+	for _, taskType := range []string{"upload", "download", "delete"} {
+		tasks, _ := store.ListPendingTasks(taskType, 100)
+		if len(tasks) > 0 {
+			fmt.Printf("pending %s: %d\n", taskType, len(tasks))
+		}
+	}
+	return nil
+}
+
+// openSyncStore returns a Store at the default location.
+func openSyncStore() (*sqlite.Store, error) {
+	dir := filepath.Join(os.TempDir(), "hddctl-store")
+	return sqlite.Open(dir)
+}
+
+var _ = time.Now

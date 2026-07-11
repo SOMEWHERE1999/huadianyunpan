@@ -1,0 +1,134 @@
+﻿// Package mock provides an in-memory Provider for testing and development.
+package mock
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+	"time"
+
+	"ncepupan/hdd/internal/cloud"
+	"ncepupan/hdd/internal/domain"
+)
+
+// Compile-time check: MockProvider satisfies cloud.Provider.
+var _ cloud.Provider = (*MockProvider)(nil)
+
+// MockProvider is an in-memory cloud provider for testing.
+type MockProvider struct {
+	mu       sync.RWMutex
+	files    map[string][]byte
+	meta     map[string]domain.FileInfo
+	baseTime time.Time
+}
+
+// New creates a new MockProvider.
+func New() *MockProvider {
+	return &MockProvider{
+		files:    make(map[string][]byte),
+		meta:     make(map[string]domain.FileInfo),
+		baseTime: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
+}
+
+func (m *MockProvider) Name() string { return "mock" }
+
+func (m *MockProvider) Connect(_ context.Context) error    { return nil }
+func (m *MockProvider) Disconnect(_ context.Context) error { return nil }
+
+func (m *MockProvider) ListFiles(_ context.Context, remotePath string) ([]domain.FileInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	prefix := strings.TrimRight(remotePath, "/")
+	if prefix != "" {
+		prefix += "/"
+	}
+
+	var results []domain.FileInfo
+	for path, fi := range m.meta {
+		if strings.HasPrefix(path, prefix) {
+			results = append(results, fi)
+		}
+	}
+	return results, nil
+}
+
+func (m *MockProvider) Download(_ context.Context, remotePath string, w io.Writer) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	data, ok := m.files[remotePath]
+	if !ok {
+		return fmt.Errorf("mock: file not found: %s", remotePath)
+	}
+	_, err := w.Write(data)
+	return err
+}
+
+func (m *MockProvider) Upload(_ context.Context, remotePath string, r io.Reader, size int64) error {
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.files[remotePath] = buf.Bytes()
+	m.meta[remotePath] = domain.FileInfo{
+		Path:    remotePath,
+		Size:    int64(buf.Len()),
+		ModTime: time.Now(),
+		ETag:    fmt.Sprintf("etag-%d", buf.Len()),
+	}
+	return nil
+}
+
+func (m *MockProvider) Delete(_ context.Context, remotePath string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.files[remotePath]; !ok {
+		return errors.New("mock: file not found")
+	}
+	delete(m.files, remotePath)
+	delete(m.meta, remotePath)
+	return nil
+}
+
+func (m *MockProvider) Move(_ context.Context, oldPath, newPath string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	data, ok := m.files[oldPath]
+	if !ok {
+		return fmt.Errorf("mock: source not found: %s", oldPath)
+	}
+	m.files[newPath] = data
+	delete(m.files, oldPath)
+
+	if fi, ok := m.meta[oldPath]; ok {
+		fi.Path = newPath
+		m.meta[newPath] = fi
+		delete(m.meta, oldPath)
+	}
+	return nil
+}
+
+// PutFile is a test helper that inserts a file into the mock store.
+func (m *MockProvider) PutFile(path string, data []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.files[path] = data
+	m.meta[path] = domain.FileInfo{
+		Path:    path,
+		Size:    int64(len(data)),
+		ModTime: m.baseTime,
+		ETag:    fmt.Sprintf("etag-%d", len(data)),
+	}
+}

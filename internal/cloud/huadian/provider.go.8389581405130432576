@@ -1,0 +1,1518 @@
+// Package huadian implements the cloud.Provider interface for the
+// Huadian AnyShare cloud storage service.
+//
+// All HTTP endpoints are confirmed via browser HAR capture.
+// Unconfirmed interfaces return ErrNotImplemented.
+// Security: no passwords, tokens, or cookies are logged or stored in plaintext.
+package huadian
+
+import (
+	"bytes"
+	"context"
+	"crypto/md5"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hash/crc32"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/http/cookiejar"
+	"net/url"
+	"net/textproto"
+	"os"
+	"path"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"ncepupan/hdd/internal/cloud"
+	"ncepupan/hdd/internal/domain"
+	securelog "ncepupan/hdd/internal/logging"
+)
+
+// Compile-time check.
+var _ cloud.Provider = (*Provider)(nil)
+var _ cloud.DirectRemoteProvider = (*Provider)(nil)
+
+// Sentinel errors.
+var (
+	ErrNotImplemented           = errors.New("huadian: not implemented")
+	ErrInteractiveLoginRequired = errors.New("huadian: interactive login required; obtain tokens via browser")
+	ErrUnauthorized             = errors.New("huadian: unauthorized")
+	ErrForbidden                = errors.New("huadian: forbidden")
+	ErrNotFound                 = errors.New("huadian: not found")
+	ErrAlreadyExists            = errors.New("huadian: already_exists")
+	ErrNotDirectory             = errors.New("huadian: not_directory")
+	ErrSourceIsDirectory        = errors.New("huadian: source_is_directory")
+	ErrInvalidMoveSameParent    = errors.New("huadian: invalid_move_same_parent; use remote rename to change a name")
+	ErrInvalidMoveDescendant    = errors.New("huadian: invalid_move_into_descendant")
+	ErrInvalidCopyDescendant    = errors.New("huadian: invalid_copy_into_descendant")
+	ErrCrossLibrary             = errors.New("huadian: cross_doc_library_unsupported")
+	ErrUnsupportedConflict      = errors.New("huadian: unsupported_conflict_policy")
+	ErrUnsupportedDirUpload     = errors.New("huadian: unsupported_conflict_policy_for_directory_upload")
+	ErrUnsupportedDirCopyFail   = errors.New("huadian: unsupported_conflict_policy_for_directory_copy")
+	ErrUnsupportedDirMove       = errors.New("huadian: unsupported_conflict_policy_for_directory_move")
+	ErrUnsupportedFileMove      = errors.New("huadian: unsupported_conflict_policy_for_file_move")
+	ErrMalformedResponse        = errors.New("huadian: malformed_response")
+	ErrSuggestName              = errors.New("huadian: suggest_name_failed")
+	ErrStorageUpload            = errors.New("huadian: object_storage_upload_failed")
+	ErrUploadFinalize           = errors.New("huadian: upload_finalize_failed")
+	ErrVerification             = errors.New("huadian: remote_verification_failed")
+	ErrPartialDirectoryUpload   = errors.New("huadian: partial_directory_upload")
+	ErrInvalidLocalEntry        = errors.New("huadian: invalid_local_entry")
+	ErrResponseTooLarge         = errors.New("huadian: API response exceeded size limit")
+)
+
+const (
+	baseURL        = "https://pan.ncepu.edu.cn"
+	defaultTimeout = 30 * time.Second
+)
+
+// Provider implements cloud.Provider for Huadian AnyShare.
+type Provider struct {
+	baseURL     string
+	accessToken string
+	useToken    bool
+	userID      string
+	csrfToken   string
+	client      *http.Client
+
+	rootDocID  string
+	pathMu     sync.RWMutex
+	docidCache map[string]string    // remote path → docid
+	entryCache map[string]fileEntry // remote path → cached metadata
+}
+
+// New creates a Provider.  accessToken may be empty (caller must supply
+// a valid token before making API calls), in which case Connect will
+// return ErrUnauthorized unless cookies are set.
+func New(accessToken string) *Provider {
+	return &Provider{
+		baseURL:     baseURL,
+		accessToken: accessToken,
+		useToken:    accessToken != "",
+		client: &http.Client{
+			Timeout: defaultTimeout,
+		},
+		docidCache: make(map[string]string),
+		entryCache: make(map[string]fileEntry),
+	}
+}
+
+// SetUserID stores the userid for root-docid auto-discovery.
+func (p *Provider) SetUserID(userID string) {
+	p.userID = userID
+}
+
+// DisableTokenAuth prevents the provider from sending the Bearer
+// token in API requests. Use this when authentication is handled
+// exclusively by cookies (e.g., OAuth2 session cookies).
+func (p *Provider) DisableTokenAuth() {
+	p.useToken = false
+}
+
+// SetCSRFToken sets the CSRF token to include as X-CSRF-TOKEN header.
+// The AnyShare API gateway requires this for state-changing requests.
+func (p *Provider) SetCSRFToken(token string) {
+	p.csrfToken = token
+}
+
+func (p *Provider) Name() string { return "huadian" }
+
+// SetCookies injects HTTP cookies into the provider's HTTP client via a
+// cookie jar. All subsequent API requests will include these cookies
+// alongside the Bearer authorization header.
+func (p *Provider) SetCookies(cookies []*http.Cookie) {
+	if len(cookies) == 0 {
+		return
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return
+	}
+	u, _ := url.Parse(p.baseURL)
+	jar.SetCookies(u, cookies)
+	p.client.Jar = jar
+}
+
+// NewWithSession creates a provider from a stored login session.
+// It constructs a cookie jar from the session cookies and uses
+// the access token for Bearer authorization.
+func NewWithSession(accessToken string, storedCookies []*http.Cookie) *Provider {
+	p := New(accessToken)
+	p.SetCookies(storedCookies)
+	return p
+}
+
+// SetRootDocID sets the root directory docid for path-to-docid resolution.
+func (p *Provider) SetRootDocID(docID string) {
+	p.pathMu.Lock()
+	defer p.pathMu.Unlock()
+	p.rootDocID = docID
+	p.docidCache["/"] = docID
+}
+
+// ---------------------------------------------------------------------------
+// Path resolution helpers
+// ---------------------------------------------------------------------------
+
+func cleanRemote(remotePath string) string {
+	s := strings.TrimSpace(remotePath)
+	if s == "" || s == "/" {
+		return "/"
+	}
+	return "/" + strings.Trim(s, "/")
+}
+
+func dirAndName(remotePath string) (parentDir, name string) {
+	clean := cleanRemote(remotePath)
+	if clean == "/" {
+		return "/", ""
+	}
+	name = path.Base(clean)
+	parentDir = path.Dir(clean)
+	if parentDir == "." {
+		parentDir = "/"
+	}
+	return parentDir, name
+}
+
+func (p *Provider) cachedDocID(remotePath string) (string, bool) {
+	p.pathMu.RLock()
+	defer p.pathMu.RUnlock()
+	id, ok := p.docidCache[cleanRemote(remotePath)]
+	return id, ok
+}
+
+func (p *Provider) cacheDocID(remotePath, docID string) {
+	p.pathMu.Lock()
+	defer p.pathMu.Unlock()
+	p.docidCache[cleanRemote(remotePath)] = docID
+}
+
+func (p *Provider) cachedEntry(remotePath string) *fileEntry {
+	p.pathMu.RLock()
+	defer p.pathMu.RUnlock()
+	e, ok := p.entryCache[cleanRemote(remotePath)]
+	if !ok {
+		return nil
+	}
+	return &e
+}
+
+func (p *Provider) cacheEntry(remotePath string, e fileEntry) {
+	p.pathMu.Lock()
+	defer p.pathMu.Unlock()
+	p.entryCache[cleanRemote(remotePath)] = e
+}
+
+// invalidateCache removes the given path and all descendants from
+// both the docid and entry caches.
+func (p *Provider) invalidateCache(remotePath string) {
+	p.pathMu.Lock()
+	defer p.pathMu.Unlock()
+	rp := cleanRemote(remotePath)
+	prefix := rp + "/"
+	for k := range p.docidCache {
+		if k == rp || strings.HasPrefix(k, prefix) {
+			delete(p.docidCache, k)
+		}
+	}
+	for k := range p.entryCache {
+		if k == rp || strings.HasPrefix(k, prefix) {
+			delete(p.entryCache, k)
+		}
+	}
+}
+
+// resolvePath resolves a remote path to its docid and metadata by
+// walking from the root directory, listing each level from the server.
+// It populates the cache with full-path keys as it descends.
+//
+// The path parameter is interpreted relative to the root.
+func (p *Provider) resolvePath(ctx context.Context, remotePath string) (string, error) {
+	rp := cleanRemote(remotePath)
+	if rp == "/" {
+		p.pathMu.RLock()
+		rootID := p.rootDocID
+		p.pathMu.RUnlock()
+		if rootID == "" {
+			return "", fmt.Errorf("huadian: root docid not set")
+		}
+		return rootID, nil
+	}
+
+	// Fast path: already cached.
+	if docID, ok := p.cachedDocID(rp); ok {
+		return docID, nil
+	}
+
+	// Walk segments from root.
+	segs := strings.Split(strings.Trim(rp, "/"), "/")
+	currentDocID := ""
+	{
+		p.pathMu.RLock()
+		currentDocID = p.rootDocID
+		p.pathMu.RUnlock()
+	}
+	if currentDocID == "" {
+		return "", fmt.Errorf("huadian: root docid not set")
+	}
+
+	builtPath := ""
+	for i, seg := range segs {
+		builtPath += "/" + seg
+		// Check cache at this level.
+		if id, ok := p.cachedDocID(builtPath); ok {
+			currentDocID = id
+			continue
+		}
+
+		// List current directory via server.
+		entries, err := p.listByDocID(ctx, currentDocID, cleanRemote(builtPath[:strings.LastIndex(builtPath, "/")]))
+		if err != nil {
+			return "", fmt.Errorf("huadian: resolve %q: %w", remotePath, err)
+		}
+		_ = entries
+
+		// Look up this segment in the freshly-populated cache.
+		if id, ok := p.cachedDocID(builtPath); ok {
+			currentDocID = id
+			// Verify intermediate segment is a directory.
+			e := p.cachedEntry(builtPath)
+			if e != nil && !e.IsDir && i < len(segs)-1 {
+				return "", fmt.Errorf("huadian: path component %q is not a directory", seg)
+			}
+			continue
+		}
+		return "", fmt.Errorf("huadian: path not found: %q", remotePath)
+	}
+	return currentDocID, nil
+}
+
+// resolveDocID returns the docid for a remote path.
+func (p *Provider) resolveDocID(ctx context.Context, remotePath string) (string, error) {
+	return p.resolvePath(ctx, remotePath)
+}
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+func (p *Provider) Connect(_ context.Context) error {
+	if p.accessToken == "" && (p.client.Jar == nil) {
+		return ErrInteractiveLoginRequired
+	}
+	return nil
+}
+
+func (p *Provider) UploadFile(ctx context.Context, localPath, remotePath string, policy cloud.UploadConflictPolicy) (cloud.UploadResult, error) {
+	info, err := os.Lstat(localPath)
+	if err != nil {
+		return cloud.UploadResult{}, fmt.Errorf("stat local file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return cloud.UploadResult{}, ErrInvalidLocalEntry
+	}
+	file, err := os.Open(localPath)
+	if err != nil {
+		return cloud.UploadResult{}, fmt.Errorf("open local file: %w", err)
+	}
+	defer file.Close()
+	parent, requestedName := dirAndName(remotePath)
+	if requestedName == "" {
+		return cloud.UploadResult{}, ErrSourceIsDirectory
+	}
+	parentID, err := p.resolvePath(ctx, parent)
+	if err != nil {
+		return cloud.UploadResult{}, err
+	}
+	name := requestedName
+	if policy == cloud.UploadConflictAutoRename {
+		name, err = p.suggestName(ctx, "/api/efast/v1/file/getsuggestname", parentID, name)
+		if err != nil {
+			return cloud.UploadResult{}, err
+		}
+	}
+	done, err := p.uploadSeekable(ctx, parentID, name, file, info.Size(), info.ModTime(), policy)
+	if err != nil {
+		return cloud.UploadResult{}, err
+	}
+	finalName := done.Name
+	if finalName == "" {
+		finalName = name
+	}
+	p.invalidateCache(parent)
+	verified, err := p.verifyUploadedFile(ctx, parent, requestedName, finalName, info.Size(), done.Rev, policy)
+	if err != nil {
+		return cloud.UploadResult{}, err
+	}
+	return cloud.UploadResult{RequestedPath: cleanRemote(remotePath), FinalPath: verified.Path, FinalName: path.Base(verified.Path), Size: verified.Size, Revision: verified.ETag, Updated: policy == cloud.UploadConflictOverwrite}, nil
+}
+
+func (p *Provider) uploadByDocID(ctx context.Context, parentDocID, name string, data []byte, mtime time.Time, policy cloud.UploadConflictPolicy) (uploadResponse, error) {
+	return p.uploadSeekable(ctx, parentDocID, name, bytes.NewReader(data), int64(len(data)), mtime, policy)
+}
+
+func (p *Provider) uploadSeekable(ctx context.Context, parentDocID, name string, content io.ReadSeeker, size int64, mtime time.Time, policy cloud.UploadConflictPolicy) (uploadResponse, error) {
+	ondup := 1
+	if policy == cloud.UploadConflictOverwrite {
+		ondup = 3
+	}
+	if policy != cloud.UploadConflictFail && policy != cloud.UploadConflictAutoRename && policy != cloud.UploadConflictOverwrite {
+		return uploadResponse{}, ErrUnsupportedConflict
+	}
+	md5Hash := md5.New()
+	crcHash := crc32.NewIEEE()
+	written, err := io.Copy(io.MultiWriter(md5Hash, crcHash), content)
+	if err != nil {
+		return uploadResponse{}, fmt.Errorf("read upload: %w", err)
+	}
+	if written != size {
+		return uploadResponse{}, fmt.Errorf("size mismatch: got %d, want %d", written, size)
+	}
+	if _, err := content.Seek(0, io.SeekStart); err != nil {
+		return uploadResponse{}, fmt.Errorf("rewind upload: %w", err)
+	}
+	md5Sum := fmt.Sprintf("%x", md5Hash.Sum(nil))
+	var predup predupResponse
+	if err := p.post(ctx, "/api/efast/v1/file/predupload", predupRequest{SliceMD5: md5Sum, Length: size}, &predup); err != nil {
+		return uploadResponse{}, fmt.Errorf("predupload: %w", err)
+	}
+	clientTime := mtime.UnixMicro()
+	if predup.Match {
+		var done uploadResponse
+		err := p.post(ctx, "/api/efast/v1/file/dupload", directUploadRequest{DocID: parentDocID, Name: name, Length: size, MD5: md5Sum, CRC32: fmt.Sprintf("%d", crcHash.Sum32()), ClientTime: clientTime, OnDup: ondup, CSFLevel: 0}, &done)
+		if err != nil {
+			return uploadResponse{}, fmt.Errorf("dupload: %w", err)
+		}
+		if done.DocID == "" {
+			return uploadResponse{}, ErrMalformedResponse
+		}
+		return done, nil
+	}
+	var begin osBeginUploadResponse
+	if err := p.post(ctx, "/api/efast/v1/file/osbeginupload", osBeginUploadRequest{UseHTTPS: true, ReqMethod: "POST", Name: name, DocID: parentDocID, OnDup: ondup, Length: size, ClientTime: clientTime}, &begin); err != nil {
+		return uploadResponse{}, fmt.Errorf("osbeginupload: %w", err)
+	}
+	if begin.DocID == "" || begin.Rev == "" || len(begin.AuthRequest) == 0 {
+		return uploadResponse{}, ErrMalformedResponse
+	}
+	ar, err := parseUploadAuthRequest(begin.AuthRequest)
+	if err != nil {
+		return uploadResponse{}, fmt.Errorf("%w: %v", ErrMalformedResponse, err)
+	}
+	if err := p.uploadToStorage(ctx, ar, content, size, name); err != nil {
+		return uploadResponse{}, fmt.Errorf("%w: %v", ErrStorageUpload, err)
+	}
+	if err := p.post(ctx, "/api/efast/v1/file/osendupload", osEndUploadRequest{DocID: begin.DocID, Rev: begin.Rev, CSFLevel: 0}, nil); err != nil {
+		return uploadResponse{}, fmt.Errorf("%w: %v", ErrUploadFinalize, err)
+	}
+	return uploadResponse{DocID: begin.DocID, Rev: begin.Rev, Name: begin.Name}, nil
+}
+
+func (p *Provider) suggestName(ctx context.Context, endpoint, parentID, name string) (string, error) {
+	var resp suggestNameResponse
+	if err := p.post(ctx, endpoint, map[string]string{"docid": parentID, "name": name}, &resp); err != nil {
+		return "", fmt.Errorf("%w: %v", ErrSuggestName, err)
+	}
+	if strings.TrimSpace(resp.Name) == "" {
+		return "", ErrSuggestName
+	}
+	return resp.Name, nil
+}
+
+func (p *Provider) verifyUploadedFile(ctx context.Context, parent, requested, expected string, size int64, rev string, policy cloud.UploadConflictPolicy) (domain.FileInfo, error) {
+	entries, err := p.List(ctx, parent)
+	if err != nil {
+		return domain.FileInfo{}, fmt.Errorf("%w: %v", ErrVerification, err)
+	}
+	var matches []domain.FileInfo
+	for _, entry := range entries {
+		if !entry.IsDir && strings.EqualFold(path.Base(entry.Path), expected) {
+			matches = append(matches, entry)
+		}
+	}
+	if len(matches) != 1 || matches[0].Size != size || (rev != "" && matches[0].ETag != "" && matches[0].ETag != rev) {
+		return domain.FileInfo{}, ErrVerification
+	}
+	if policy == cloud.UploadConflictOverwrite {
+		count := 0
+		for _, entry := range entries {
+			if !entry.IsDir && strings.EqualFold(path.Base(entry.Path), requested) {
+				count++
+			}
+		}
+		if count != 1 {
+			return domain.FileInfo{}, ErrVerification
+		}
+	}
+	return matches[0], nil
+}
+
+func (p *Provider) Disconnect(_ context.Context) error { return nil }
+
+func (p *Provider) Login(ctx context.Context) error {
+	return ErrInteractiveLoginRequired
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+// setBrowserHeaders sets WAF-bypass headers on the request to mimic
+// a real Edge/Chrome browser. The CDN/WAF at pan.ncepu.edu.cn and
+// its storage servers reject requests without these.
+func setBrowserHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0")
+	req.Header.Set("sec-ch-ua", `"Microsoft Edge";v="149", "Chromium";v="149", "Not)A;Brand";v="24"`)
+	req.Header.Set("sec-ch-ua-mobile", "?0")
+	req.Header.Set("sec-ch-ua-platform", `"Windows"`)
+	req.Header.Set("Date", time.Now().UTC().Format(time.RFC1123))
+}
+
+func (p *Provider) post(ctx context.Context, apiPath string, body any, result any) error {
+	url := p.baseURL + apiPath
+
+	var reqBody io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("marshal: %w", err)
+		}
+		reqBody = bytes.NewReader(data)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, reqBody)
+	if err != nil {
+		return fmt.Errorf("new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+	setBrowserHeaders(req)
+	req.Header.Set("X-Language", "zh-CN")
+	req.Header.Set("Referer", p.baseURL+"/anyshare/")
+	req.Header.Set("Origin", p.baseURL)
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	if p.csrfToken != "" {
+		req.Header.Set("X-CSRF-TOKEN", p.csrfToken)
+	}
+	if p.accessToken != "" && p.useToken {
+		req.Header.Set("Authorization", "Bearer "+p.accessToken)
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		securelog.LogSecurityEvent(ctx, securelog.SecurityEvent{Operation: "api_request", Method: req.Method, Path: apiPath, ErrorClass: "network"})
+		return fmt.Errorf("http: %w", err)
+	}
+	defer resp.Body.Close()
+	requestID := resp.Header.Get("X-Request-ID")
+
+	if resp.StatusCode == 401 {
+		securelog.LogSecurityEvent(ctx, securelog.SecurityEvent{Operation: "api_request", Method: req.Method, Path: apiPath, Status: resp.StatusCode, RequestID: requestID, ErrorClass: "unauthorized"})
+		return ErrUnauthorized
+	}
+	if resp.StatusCode == 403 {
+		var apiErr struct {
+			Code int `json:"code"`
+		}
+		limited, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		if json.Unmarshal(limited, &apiErr) == nil && apiErr.Code == 403002039 {
+			securelog.LogSecurityEvent(ctx, securelog.SecurityEvent{Operation: "api_request", Method: req.Method, Path: apiPath, Status: resp.StatusCode, RequestID: requestID, ErrorClass: "already_exists"})
+			return ErrAlreadyExists
+		}
+		securelog.LogSecurityEvent(ctx, securelog.SecurityEvent{Operation: "api_request", Method: req.Method, Path: apiPath, Status: resp.StatusCode, RequestID: requestID, ErrorClass: "forbidden"})
+		return ErrForbidden
+	}
+	if resp.StatusCode == 404 {
+		securelog.LogSecurityEvent(ctx, securelog.SecurityEvent{Operation: "api_request", Method: req.Method, Path: apiPath, Status: resp.StatusCode, RequestID: requestID, ErrorClass: "not_found"})
+		return ErrNotFound
+	}
+	if resp.StatusCode >= 400 {
+		securelog.LogSecurityEvent(ctx, securelog.SecurityEvent{Operation: "api_request", Method: req.Method, Path: apiPath, Status: resp.StatusCode, RequestID: requestID, ErrorClass: "remote_error"})
+		return fmt.Errorf("huadian: remote status %d", resp.StatusCode)
+	}
+
+	if result != nil {
+		const maxJSONResp = 2 << 20 // 2 MiB
+		lr := io.LimitReader(resp.Body, maxJSONResp+1)
+		rawBody, err := io.ReadAll(lr)
+		if err != nil {
+			return fmt.Errorf("read response: %w", err)
+		}
+		if len(rawBody) > maxJSONResp {
+			return ErrResponseTooLarge
+		}
+		if err := json.Unmarshal(rawBody, result); err != nil {
+			return fmt.Errorf("decode: %w", err)
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// List
+// ---------------------------------------------------------------------------
+
+type dirListRequest struct {
+	DocID string `json:"docid"`
+	Sort  string `json:"sort,omitempty"`
+	By    string `json:"by,omitempty"`
+	Count int    `json:"count,omitempty"`
+}
+
+type dirListResponse struct {
+	Dirs  []fileEntry `json:"dirs"`
+	Files []fileEntry `json:"files"`
+}
+
+type fileEntry struct {
+	DocID    string `json:"docid"`
+	Name     string `json:"name"`
+	Size     int64  `json:"size,omitempty"`
+	Rev      string `json:"rev"`
+	Modified int64  `json:"modified"` // microseconds
+	Editor   string `json:"editor"`
+	IsDir    bool   `json:"isdir"`
+}
+
+func (p *Provider) List(ctx context.Context, remotePath string) ([]domain.FileInfo, error) {
+	rp := cleanRemote(remotePath)
+	if rp == "/" {
+		p.pathMu.RLock()
+		rid := p.rootDocID
+		p.pathMu.RUnlock()
+		if rid == "" {
+			return nil, fmt.Errorf("huadian List: root docid not set")
+		}
+		return p.listByDocID(ctx, rid, "/")
+	}
+	docID, err := p.resolvePath(ctx, remotePath)
+	if err != nil {
+		return nil, fmt.Errorf("huadian List(%q): %w", remotePath, err)
+	}
+	e := p.cachedEntry(rp)
+	if e != nil && !e.IsDir {
+		return nil, fmt.Errorf("huadian List(%q): not a directory", remotePath)
+	}
+	return p.listByDocID(ctx, docID, rp)
+}
+
+// listByDocID lists directory contents via the API and caches results.
+// parentDir is the full remote path of the directory being listed,
+// used to construct correct full-path cache keys.
+func (p *Provider) listByDocID(ctx context.Context, docID string, parentDir string) ([]domain.FileInfo, error) {
+	var resp dirListResponse
+	req := dirListRequest{DocID: docID, Count: 100}
+	if err := p.post(ctx, "/api/efast/v1/dir/list", req, &resp); err != nil {
+		return nil, err
+	}
+	parentDir = cleanRemote(parentDir)
+	var out []domain.FileInfo
+	for _, e := range resp.Dirs {
+		e.IsDir = true
+		entryPath := parentPathJoin(parentDir, e.Name)
+		out = append(out, domain.FileInfo{
+			Path:    entryPath,
+			Size:    e.Size,
+			ModTime: time.UnixMicro(e.Modified),
+			IsDir:   true,
+			ETag:    e.Rev,
+		})
+		p.cacheDocID(entryPath, e.DocID)
+		p.cacheEntry(entryPath, e)
+	}
+	for _, e := range resp.Files {
+		entryPath := parentPathJoin(parentDir, e.Name)
+		out = append(out, domain.FileInfo{
+			Path:    entryPath,
+			Size:    e.Size,
+			ModTime: time.UnixMicro(e.Modified),
+			IsDir:   false,
+			ETag:    e.Rev,
+		})
+		p.cacheDocID(entryPath, e.DocID)
+		p.cacheEntry(entryPath, e)
+	}
+	return out, nil
+}
+
+func parentPathJoin(parent, name string) string {
+	if parent == "/" {
+		return "/" + name
+	}
+	return parent + "/" + name
+}
+
+// ListByDocID performs a directory listing using a docid.
+func (p *Provider) ListByDocID(ctx context.Context, docID string) ([]domain.FileInfo, error) {
+	return p.listByDocID(ctx, docID, "/")
+}
+
+// ---------------------------------------------------------------------------
+// Stat
+// ---------------------------------------------------------------------------
+
+type metadataRequest struct {
+	DocID string `json:"docid"`
+}
+
+type metadataResponse struct {
+	DocID    string `json:"docid"`
+	Name     string `json:"name"`
+	Size     int64  `json:"size,omitempty"`
+	Rev      string `json:"rev"`
+	Modified int64  `json:"modified"`
+	IsDir    bool   `json:"isdir"`
+}
+
+func (p *Provider) Stat(ctx context.Context, remotePath string) (domain.FileInfo, error) {
+	rp := cleanRemote(remotePath)
+
+	// Root is always a directory.
+	if rp == "/" {
+		return domain.FileInfo{Path: "/", IsDir: true}, nil
+	}
+
+	// resolvePath walks from root, listing each level via server.
+	// This populates the entry cache with full-path keys.
+	_, err := p.resolvePath(ctx, remotePath)
+	if err != nil {
+		return domain.FileInfo{}, fmt.Errorf("huadian Stat(%q): %w", remotePath, err)
+	}
+
+	// The resolvePath walk caches each discovered segment.
+	if e := p.cachedEntry(rp); e != nil {
+		return domain.FileInfo{
+			Path:    rp,
+			Size:    e.Size,
+			ModTime: time.UnixMicro(e.Modified),
+			IsDir:   e.IsDir,
+			ETag:    e.Rev,
+		}, nil
+	}
+
+	// Fallback: call metadata API if the entry was not yielded by parent listing.
+	docID, _ := p.cachedDocID(rp)
+	if docID != "" {
+		return p.StatByDocID(ctx, docID)
+	}
+	return domain.FileInfo{}, fmt.Errorf("huadian: path not found: %q", remotePath)
+}
+
+// StatByDocID returns metadata for a single file by docid.
+func (p *Provider) StatByDocID(ctx context.Context, docID string) (domain.FileInfo, error) {
+	var resp metadataResponse
+	if err := p.post(ctx, "/api/efast/v1/file/metadata", metadataRequest{DocID: docID}, &resp); err != nil {
+		return domain.FileInfo{}, err
+	}
+	info := domain.FileInfo{
+		Path:    "/" + resp.Name,
+		Size:    resp.Size,
+		ModTime: time.UnixMicro(resp.Modified),
+		IsDir:   resp.IsDir,
+		ETag:    resp.Rev,
+	}
+	p.cacheDocID(info.Path, resp.DocID)
+	return info, nil
+}
+
+// ---------------------------------------------------------------------------
+// Upload
+// ---------------------------------------------------------------------------
+
+type predupRequest struct {
+	SliceMD5 string `json:"slice_md5"`
+	Length   int64  `json:"length"`
+}
+
+type predupResponse struct {
+	Match bool `json:"match"`
+}
+
+type osBeginUploadRequest struct {
+	UseHTTPS   bool   `json:"usehttps"`
+	ReqMethod  string `json:"reqmethod"`
+	Name       string `json:"name"`
+	DocID      string `json:"docid"`
+	OnDup      int    `json:"ondup"`
+	Length     int64  `json:"length"`
+	ClientTime int64  `json:"client_mtime"`
+}
+
+type osBeginUploadResponse struct {
+	AuthRequest json.RawMessage `json:"authrequest"`
+	DocID       string          `json:"docid"`
+	Rev         string          `json:"rev"`
+	Name        string          `json:"name"`
+}
+
+type osEndUploadRequest struct {
+	DocID    string `json:"docid"`
+	Rev      string `json:"rev"`
+	CSFLevel int    `json:"csflevel"`
+}
+
+type directUploadRequest struct {
+	DocID      string `json:"docid"`
+	Name       string `json:"name"`
+	Length     int64  `json:"length"`
+	MD5        string `json:"md5"`
+	CRC32      string `json:"crc32"`
+	ClientTime int64  `json:"client_mtime"`
+	OnDup      int    `json:"ondup"`
+	CSFLevel   int    `json:"csflevel"`
+}
+
+type uploadResponse struct {
+	DocID   string `json:"docid"`
+	Name    string `json:"name"`
+	Rev     string `json:"rev"`
+	Success bool   `json:"success"`
+}
+
+type suggestNameResponse struct {
+	Name string `json:"name"`
+}
+
+func (p *Provider) Upload(ctx context.Context, remotePath string, r io.Reader) error {
+	parentDir, name := dirAndName(remotePath)
+	docID, err := p.resolvePath(ctx, parentDir)
+	if err != nil {
+		return fmt.Errorf("huadian Upload(%q): %w", remotePath, err)
+	}
+	tmp, err := os.CreateTemp("", "hdd-upload-*")
+	if err != nil {
+		return fmt.Errorf("create upload spool: %w", err)
+	}
+	defer func() { _ = tmp.Close(); _ = os.Remove(tmp.Name()) }()
+	size, err := io.Copy(tmp, r)
+	if err != nil {
+		return fmt.Errorf("spool upload: %w", err)
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind upload spool: %w", err)
+	}
+	if _, err := p.uploadSeekable(ctx, docID, name, tmp, size, time.Now(), cloud.UploadConflictFail); err != nil {
+		return err
+	}
+	// Invalidate parent so subsequent List returns fresh data.
+	p.invalidateCache(parentDir)
+	return nil
+}
+
+// UploadByDocID performs the full AnyShare upload flow.
+func (p *Provider) UploadByDocID(ctx context.Context, parentDocID, name string, r io.Reader, size int64) error {
+	// Step 1: predupload (MD5 check) — compute MD5 streaming.
+	tmp, err := os.CreateTemp("", "hdd-upload-*")
+	if err != nil {
+		return fmt.Errorf("create upload spool: %w", err)
+	}
+	defer func() { _ = tmp.Close(); _ = os.Remove(tmp.Name()) }()
+	written, err := io.Copy(tmp, io.LimitReader(r, size+1))
+	if err != nil {
+		return fmt.Errorf("spool upload: %w", err)
+	}
+	if written != size {
+		return fmt.Errorf("size mismatch: got %d, want %d", written, size)
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind upload spool: %w", err)
+	}
+	_, err = p.uploadSeekable(ctx, parentDocID, name, tmp, size, time.Now(), cloud.UploadConflictFail)
+	return err
+}
+
+type authRequest struct {
+	Method    string            `json:"method"`
+	URL       string            `json:"url"`
+	Policy    string            `json:"policy,omitempty"`
+	Signature string            `json:"signature,omitempty"`
+	Key       string            `json:"key,omitempty"`
+	Headers   map[string]string `json:"-"`
+	Fields    []authField       `json:"-"`
+}
+
+type authField struct {
+	Name  string
+	Value string
+}
+
+// parseAuthRequest handles object, string-array, and object-array forms.
+func parseAuthRequest(raw json.RawMessage) (*authRequest, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("empty authrequest")
+	}
+	// 1. Object form (upload): {"method":"PUT","url":"https://...",...}
+	var ar authRequest
+	if err := json.Unmarshal(raw, &ar); err == nil && ar.URL != "" {
+		return &ar, nil
+	}
+	// 2. String array form (download): ["GET","https://...","Authorization: AWS ...","x-amz-date: ..."]
+	var arr []string
+	if err := json.Unmarshal(raw, &arr); err == nil && len(arr) >= 2 {
+		ar := &authRequest{Method: arr[0], URL: arr[1]}
+		if len(arr) > 2 {
+			ar.Headers = make(map[string]string)
+			for _, h := range arr[2:] {
+				if idx := strings.IndexByte(h, ':'); idx > 0 {
+					ar.Headers[strings.TrimSpace(h[:idx])] = strings.TrimSpace(h[idx+1:])
+				}
+			}
+		}
+		return ar, nil
+	}
+	// 3. Object array form (compat): [{"method":"PUT",...}]
+	var ars []authRequest
+	if err := json.Unmarshal(raw, &ars); err == nil && len(ars) > 0 {
+		return &ars[0], nil
+	}
+	return nil, fmt.Errorf("authrequest: unsupported format")
+}
+
+func parseUploadAuthRequest(raw json.RawMessage) (*authRequest, error) {
+	var values []string
+	if err := json.Unmarshal(raw, &values); err != nil || len(values) < 2 {
+		return nil, errors.New("upload authrequest: malformed array")
+	}
+	if !strings.EqualFold(values[0], http.MethodPost) {
+		return nil, errors.New("upload authrequest: unsupported method")
+	}
+	parsedURL, err := url.Parse(values[1])
+	if err != nil || parsedURL.Host == "" || (parsedURL.Scheme != "https" && parsedURL.Scheme != "http") {
+		return nil, errors.New("upload authrequest: invalid URL")
+	}
+	ar := &authRequest{Method: http.MethodPost, URL: values[1]}
+	required := map[string]bool{
+		"AWSAccessKeyId": false,
+		"Content-Type":   false,
+		"Policy":         false,
+		"Signature":      false,
+		"key":            false,
+	}
+	for _, line := range values[2:] {
+		name, value, ok := strings.Cut(line, ":")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" {
+			return nil, errors.New("upload authrequest: malformed field")
+		}
+		if strings.HasPrefix(value, " ") {
+			value = value[1:]
+		}
+		ar.Fields = append(ar.Fields, authField{Name: name, Value: value})
+		if _, ok := required[name]; ok {
+			required[name] = true
+		}
+	}
+	for _, name := range []string{"AWSAccessKeyId", "Content-Type", "Policy", "Signature", "key"} {
+		if !required[name] {
+			return nil, fmt.Errorf("upload authrequest: missing field %s", name)
+		}
+	}
+	return ar, nil
+}
+
+func buildMultipartUpload(ar *authRequest, file io.Reader, fileSize int64, filename string) (io.Reader, string, int64, error) {
+	var preamble bytes.Buffer
+	w := multipart.NewWriter(&preamble)
+	for _, field := range ar.Fields {
+		if err := w.WriteField(field.Name, field.Value); err != nil {
+			return nil, "", 0, err
+		}
+	}
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, strings.ReplaceAll(filepath.Base(filename), `"`, `\"`)))
+	header.Set("Content-Type", "application/octet-stream")
+	if _, err := w.CreatePart(header); err != nil {
+		return nil, "", 0, err
+	}
+
+	var epilogue bytes.Buffer
+	closing := multipart.NewWriter(&epilogue)
+	if err := closing.SetBoundary(w.Boundary()); err != nil {
+		return nil, "", 0, err
+	}
+	if err := closing.Close(); err != nil {
+		return nil, "", 0, err
+	}
+	length := int64(preamble.Len()) + fileSize + int64(epilogue.Len())
+	return io.MultiReader(bytes.NewReader(preamble.Bytes()), file, bytes.NewReader(epilogue.Bytes())), w.FormDataContentType(), length, nil
+}
+
+func (p *Provider) uploadToStorage(ctx context.Context, ar *authRequest, file io.Reader, fileSize int64, filename string) error {
+	body, contentType, contentLength, err := buildMultipartUpload(ar, file, fileSize, filename)
+	if err != nil {
+		return errors.New("invalid object storage multipart request")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ar.URL, body)
+	if err != nil {
+		return errors.New("invalid object storage request")
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.ContentLength = contentLength
+	storageClient := &http.Client{
+		Timeout: defaultTimeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return errors.New("object storage redirect refused")
+		},
+	}
+	resp, err := storageClient.Do(req)
+	if err != nil {
+		securelog.LogSecurityEvent(ctx, securelog.SecurityEvent{Operation: "storage_upload", Method: ar.Method, Path: "<signed>", ErrorClass: "network"})
+		return errors.New("object storage request failed")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		code := storageErrorCode(resp.Body)
+		securelog.LogSecurityEvent(ctx, securelog.SecurityEvent{Operation: "storage_upload", Method: ar.Method, Path: "<signed>", Status: resp.StatusCode, RequestID: resp.Header.Get("X-Request-ID"), ErrorClass: "remote_error"})
+		if code != "" {
+			return fmt.Errorf("storage upload: status=%d code=%s", resp.StatusCode, code)
+		}
+		return fmt.Errorf("storage upload: status=%d", resp.StatusCode)
+	}
+	return nil
+}
+
+func storageErrorCode(r io.Reader) string {
+	raw, _ := io.ReadAll(io.LimitReader(r, 64<<10))
+	start := bytes.Index(raw, []byte("<Code>"))
+	end := bytes.Index(raw, []byte("</Code>"))
+	if start < 0 || end <= start+len("<Code>") {
+		return ""
+	}
+	code := string(raw[start+len("<Code>") : end])
+	for _, ch := range code {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.') {
+			return ""
+		}
+	}
+	return code
+}
+
+// ---------------------------------------------------------------------------
+// Download
+// ---------------------------------------------------------------------------
+
+type osDownloadRequest struct {
+	DocID string `json:"docid"`
+}
+
+type osDownloadResponse struct {
+	AuthRequest   json.RawMessage `json:"authrequest"`
+	Name          string          `json:"name"`
+	Size          int64           `json:"size"`
+	Rev           string          `json:"rev"`
+	Modified      int64           `json:"modified"`
+	ClientMtime   int64           `json:"client_mtime"`
+	Editor        string          `json:"editor"`
+	SiteID        string          `json:"siteid"`
+	NeedWatermark bool            `json:"need_watermark"`
+}
+
+func (p *Provider) Download(ctx context.Context, remotePath string, w io.Writer) error {
+	docID, err := p.resolvePath(ctx, remotePath)
+	if err != nil {
+		return fmt.Errorf("huadian Download(%q): %w", remotePath, err)
+	}
+	return p.downloadByDocID(ctx, docID, w)
+}
+
+func (p *Provider) downloadByDocID(ctx context.Context, docID string, w io.Writer) error {
+	var dl osDownloadResponse
+	if err := p.post(ctx, "/api/efast/v1/file/osdownload", osDownloadRequest{
+		DocID: docID,
+	}, &dl); err != nil {
+		return fmt.Errorf("osdownload: %w", err)
+	}
+
+	ar, err := parseAuthRequest(dl.AuthRequest)
+	if err != nil {
+		return fmt.Errorf("parse authrequest: %w", err)
+	}
+	return p.downloadFromStorage(ctx, ar, w)
+}
+
+// DownloadByDocID performs the AnyShare download flow.
+func (p *Provider) DownloadByDocID(ctx context.Context, docID string, w io.Writer) error {
+	return p.downloadByDocID(ctx, docID, w)
+}
+
+func (p *Provider) downloadFromStorage(ctx context.Context, ar *authRequest, w io.Writer) error {
+	req, err := http.NewRequestWithContext(ctx, ar.Method, ar.URL, nil)
+	if err != nil {
+		return errors.New("invalid object storage request")
+	}
+	setBrowserHeaders(req)
+	// Auth headers override browser Date to avoid AWS signature mismatch.
+	req.Header.Del("Date")
+	for k, v := range ar.Headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := (&http.Client{Timeout: defaultTimeout}).Do(req)
+	if err != nil {
+		securelog.LogSecurityEvent(ctx, securelog.SecurityEvent{Operation: "storage_download", Method: ar.Method, Path: "<signed>", ErrorClass: "network"})
+		return errors.New("object storage request failed")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		securelog.LogSecurityEvent(ctx, securelog.SecurityEvent{Operation: "storage_download", Method: ar.Method, Path: "<signed>", Status: resp.StatusCode, RequestID: resp.Header.Get("X-Request-ID"), ErrorClass: "remote_error"})
+		return fmt.Errorf("storage download: remote status %d", resp.StatusCode)
+	}
+
+	_, err = io.Copy(w, resp.Body)
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// Mkdir
+// ---------------------------------------------------------------------------
+
+type dirCreateRequest struct {
+	DocID string `json:"docid"`
+	Name  string `json:"name"`
+	OnDup int    `json:"ondup,omitempty"`
+}
+
+type dirCreateResponse struct {
+	DocID string `json:"docid"`
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+}
+
+func (p *Provider) Mkdir(ctx context.Context, remotePath string) error {
+	parentDir, name := dirAndName(remotePath)
+	if name == "" {
+		return fmt.Errorf("huadian Mkdir: cannot create root")
+	}
+	docID, err := p.resolvePath(ctx, parentDir)
+	if err != nil {
+		return fmt.Errorf("huadian Mkdir(%q): %w", remotePath, err)
+	}
+	if err := p.MkdirByDocID(ctx, docID, name); err != nil {
+		return err
+	}
+	// Invalidate parent so subsequent List returns fresh data.
+	p.invalidateCache(parentDir)
+	return nil
+}
+
+// MkdirByDocID creates a directory under the given parent docid.
+func (p *Provider) MkdirByDocID(ctx context.Context, parentDocID, name string) error {
+	_, err := p.createDirectory(ctx, parentDocID, name, 1)
+	return err
+}
+
+func (p *Provider) createDirectory(ctx context.Context, parentDocID, name string, ondup int) (dirCreateResponse, error) {
+	var resp dirCreateResponse
+	err := p.post(ctx, "/api/efast/v1/dir/create", dirCreateRequest{
+		DocID: parentDocID,
+		Name:  name,
+		OnDup: ondup,
+	}, &resp)
+	if err != nil {
+		return dirCreateResponse{}, err
+	}
+	if resp.DocID == "" {
+		resp.DocID = resp.ID
+	}
+	if resp.DocID == "" {
+		return dirCreateResponse{}, ErrMalformedResponse
+	}
+	if resp.Name == "" {
+		resp.Name = name
+	}
+	return resp, nil
+}
+
+func (p *Provider) UploadDirectory(ctx context.Context, localDirectory, remoteParent string, policy cloud.DirectoryUploadConflictPolicy) (cloud.UploadResult, error) {
+	rootInfo, err := os.Lstat(localDirectory)
+	if err != nil {
+		return cloud.UploadResult{}, fmt.Errorf("stat local directory: %w", err)
+	}
+	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return cloud.UploadResult{}, ErrInvalidLocalEntry
+	}
+	if policy != cloud.DirectoryConflictFail {
+		return cloud.UploadResult{}, ErrUnsupportedDirUpload
+	}
+	parentInfo, err := p.Stat(ctx, remoteParent)
+	if err != nil {
+		return cloud.UploadResult{}, err
+	}
+	if !parentInfo.IsDir {
+		return cloud.UploadResult{}, ErrNotDirectory
+	}
+	parentID, err := p.resolvePath(ctx, remoteParent)
+	if err != nil {
+		return cloud.UploadResult{}, err
+	}
+	rootName := filepath.Base(filepath.Clean(localDirectory))
+	ondup := 1
+	created, err := p.createDirectory(ctx, parentID, rootName, ondup)
+	if err != nil {
+		return cloud.UploadResult{}, err
+	}
+	remoteRoot := parentPathJoin(cleanRemote(remoteParent), created.Name)
+	p.cacheDocID(remoteRoot, created.DocID)
+	p.cacheEntry(remoteRoot, fileEntry{DocID: created.DocID, Name: created.Name, IsDir: true})
+	if err := p.uploadDirectoryChildren(ctx, filepath.Clean(localDirectory), filepath.Clean(localDirectory), created.DocID, remoteRoot); err != nil {
+		return cloud.UploadResult{}, fmt.Errorf("%w: %v", ErrPartialDirectoryUpload, err)
+	}
+	p.invalidateCache(remoteParent)
+	return cloud.UploadResult{RequestedPath: parentPathJoin(cleanRemote(remoteParent), filepath.Base(filepath.Clean(localDirectory))), FinalPath: remoteRoot, FinalName: created.Name}, nil
+}
+
+func (p *Provider) uploadDirectoryChildren(ctx context.Context, root, localDir, parentID, remoteDir string) error {
+	entries, err := os.ReadDir(localDir)
+	if err != nil {
+		return err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	for _, entry := range entries {
+		localPath := filepath.Join(localDir, entry.Name())
+		rel, relErr := filepath.Rel(root, localPath)
+		if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("%s: %w", filepath.ToSlash(rel), ErrInvalidLocalEntry)
+		}
+		info, err := os.Lstat(localPath)
+		if err != nil {
+			return fmt.Errorf("%s: %w", filepath.ToSlash(rel), err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || (!info.Mode().IsRegular() && !info.IsDir()) {
+			return fmt.Errorf("%s: %w", filepath.ToSlash(rel), ErrInvalidLocalEntry)
+		}
+		if info.IsDir() {
+			created, err := p.createDirectory(ctx, parentID, entry.Name(), 1)
+			if err != nil {
+				return fmt.Errorf("%s: %w", filepath.ToSlash(rel), err)
+			}
+			childRemote := parentPathJoin(remoteDir, created.Name)
+			p.cacheDocID(childRemote, created.DocID)
+			p.cacheEntry(childRemote, fileEntry{DocID: created.DocID, Name: created.Name, IsDir: true})
+			if err := p.uploadDirectoryChildren(ctx, root, localPath, created.DocID, childRemote); err != nil {
+				return err
+			}
+			continue
+		}
+		file, err := os.Open(localPath)
+		if err != nil {
+			return fmt.Errorf("%s: %w", filepath.ToSlash(rel), err)
+		}
+		done, err := p.uploadSeekable(ctx, parentID, entry.Name(), file, info.Size(), info.ModTime(), cloud.UploadConflictFail)
+		closeErr := file.Close()
+		if err != nil {
+			return fmt.Errorf("%s: %w", filepath.ToSlash(rel), err)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("%s: %w", filepath.ToSlash(rel), closeErr)
+		}
+		finalName := done.Name
+		if finalName == "" {
+			finalName = entry.Name()
+		}
+		p.invalidateCache(remoteDir)
+		p.cacheDocID(remoteDir, parentID)
+		if _, err := p.verifyUploadedFile(ctx, remoteDir, entry.Name(), finalName, info.Size(), done.Rev, cloud.UploadConflictFail); err != nil {
+			return fmt.Errorf("%s: %w", filepath.ToSlash(rel), err)
+		}
+	}
+	return nil
+}
+
+type transferRequest struct {
+	DocID      string `json:"docid"`
+	DestParent string `json:"destparent"`
+	OnDup      int    `json:"ondup"`
+}
+
+type transferResponse struct {
+	DocID      string `json:"docid"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	IsDirExist bool   `json:"isdirexist"`
+}
+
+func (p *Provider) Copy(ctx context.Context, sourcePath, destinationDirectory string, policy cloud.TransferConflictPolicy) (cloud.TransferResult, error) {
+	return p.transfer(ctx, false, sourcePath, destinationDirectory, policy)
+}
+
+func (p *Provider) Move(ctx context.Context, sourcePath, destinationDirectory string, policy cloud.TransferConflictPolicy) (cloud.TransferResult, error) {
+	return p.transfer(ctx, true, sourcePath, destinationDirectory, policy)
+}
+
+func (p *Provider) transfer(ctx context.Context, move bool, sourcePath, destinationDirectory string, policy cloud.TransferConflictPolicy) (cloud.TransferResult, error) {
+	sourcePath = cleanRemote(sourcePath)
+	destinationDirectory = cleanRemote(destinationDirectory)
+	if sourcePath == "/" {
+		return cloud.TransferResult{}, ErrUnsupportedConflict
+	}
+	source, err := p.Stat(ctx, sourcePath)
+	if err != nil {
+		return cloud.TransferResult{}, err
+	}
+	destination, err := p.Stat(ctx, destinationDirectory)
+	if err != nil {
+		return cloud.TransferResult{}, err
+	}
+	if !destination.IsDir {
+		return cloud.TransferResult{}, ErrNotDirectory
+	}
+	if source.IsDir && (destinationDirectory == sourcePath || strings.HasPrefix(destinationDirectory, sourcePath+"/")) {
+		if move {
+			return cloud.TransferResult{}, ErrInvalidMoveDescendant
+		}
+		return cloud.TransferResult{}, ErrInvalidCopyDescendant
+	}
+	if move && remoteParent(sourcePath) == destinationDirectory {
+		return cloud.TransferResult{}, ErrInvalidMoveSameParent
+	}
+	if err := validateTransferPolicy(move, source.IsDir, policy); err != nil {
+		return cloud.TransferResult{}, err
+	}
+	sourceID, err := p.resolvePath(ctx, sourcePath)
+	if err != nil {
+		return cloud.TransferResult{}, err
+	}
+	destinationID, err := p.resolvePath(ctx, destinationDirectory)
+	if err != nil {
+		return cloud.TransferResult{}, err
+	}
+	if docLibrary(sourceID) == "" || docLibrary(sourceID) != docLibrary(destinationID) {
+		return cloud.TransferResult{}, ErrCrossLibrary
+	}
+	entries, err := p.List(ctx, destinationDirectory)
+	if err != nil {
+		return cloud.TransferResult{}, err
+	}
+	sourceName := path.Base(sourcePath)
+	var existingPath string
+	for _, entry := range entries {
+		if strings.EqualFold(path.Base(entry.Path), sourceName) {
+			existingPath = entry.Path
+			break
+		}
+	}
+	ondup := transferOnDup(policy)
+	endpoint := "/api/efast/v1/file/copy"
+	if move {
+		endpoint = "/api/efast/v1/file/move"
+	}
+	if source.IsDir {
+		endpoint = "/api/efast/v1/dir/copy"
+		if move {
+			endpoint = "/api/efast/v1/dir/move"
+		}
+	}
+	var resp transferResponse
+	if err := p.post(ctx, endpoint, transferRequest{DocID: sourceID, DestParent: destinationID, OnDup: ondup}, &resp); err != nil {
+		return cloud.TransferResult{}, err
+	}
+	responseID := resp.DocID
+	if responseID == "" {
+		responseID = resp.ID
+	}
+	if responseID == "" {
+		return cloud.TransferResult{}, ErrMalformedResponse
+	}
+
+	// Invalidate all paths whose identity or contents may have changed before
+	// reading fresh server state. In particular, merge invalidates the entire
+	// pre-existing destination subtree.
+	p.invalidateCache(destinationDirectory)
+	if existingPath != "" && (policy == cloud.TransferConflictOverwrite || policy == cloud.TransferConflictMerge) {
+		p.invalidateCache(existingPath)
+	}
+	if move {
+		p.invalidateCache(remoteParent(sourcePath))
+		p.invalidateCache(sourcePath)
+	}
+	updated, err := p.List(ctx, destinationDirectory)
+	if err != nil {
+		return cloud.TransferResult{}, verificationError(err)
+	}
+	final, finalID, ok := p.entryByDocID(updated, responseID)
+	if !ok {
+		return cloud.TransferResult{}, ErrVerification
+	}
+	name := path.Base(final.Path)
+	if resp.Name != "" {
+		name = resp.Name
+		if final.Path != parentPathJoin(destinationDirectory, name) {
+			return cloud.TransferResult{}, ErrVerification
+		}
+	}
+	finalPath := parentPathJoin(destinationDirectory, name)
+	if finalID != responseID || final.IsDir != source.IsDir || (!source.IsDir && final.Size != source.Size) {
+		return cloud.TransferResult{}, ErrVerification
+	}
+	if policy == cloud.TransferConflictOverwrite && countSameName(updated, name, false) != 1 {
+		return cloud.TransferResult{}, ErrVerification
+	}
+
+	sourceEntries := updated
+	if remoteParent(sourcePath) != destinationDirectory {
+		p.invalidateCache(remoteParent(sourcePath))
+		sourceEntries, err = p.List(ctx, remoteParent(sourcePath))
+		if err != nil {
+			return cloud.TransferResult{}, verificationError(err)
+		}
+	}
+	_, _, sourceStillExists := p.entryByDocID(sourceEntries, sourceID)
+	if move == sourceStillExists {
+		return cloud.TransferResult{}, ErrVerification
+	}
+	return cloud.TransferResult{SourcePath: sourcePath, DestinationDirectory: destinationDirectory, FinalPath: finalPath, FinalName: name}, nil
+}
+
+func validateTransferPolicy(move, isDir bool, policy cloud.TransferConflictPolicy) error {
+	if !move && isDir {
+		if policy != cloud.TransferConflictAutoRename {
+			return ErrUnsupportedDirCopyFail
+		}
+		return nil
+	}
+	if move && isDir {
+		if policy != cloud.TransferConflictFail && policy != cloud.TransferConflictMerge {
+			return ErrUnsupportedDirMove
+		}
+		return nil
+	}
+	if move && policy == cloud.TransferConflictMerge {
+		return ErrUnsupportedFileMove
+	}
+	if policy != cloud.TransferConflictFail && policy != cloud.TransferConflictAutoRename && policy != cloud.TransferConflictOverwrite {
+		return ErrUnsupportedConflict
+	}
+	return nil
+}
+
+func transferOnDup(policy cloud.TransferConflictPolicy) int {
+	switch policy {
+	case cloud.TransferConflictAutoRename:
+		return 2
+	case cloud.TransferConflictOverwrite, cloud.TransferConflictMerge:
+		return 3
+	default:
+		return 1
+	}
+}
+
+func (p *Provider) entryByDocID(entries []domain.FileInfo, docID string) (domain.FileInfo, string, bool) {
+	for _, entry := range entries {
+		if id, ok := p.cachedDocID(entry.Path); ok && id == docID {
+			return entry, id, true
+		}
+	}
+	return domain.FileInfo{}, "", false
+}
+
+func countSameName(entries []domain.FileInfo, name string, isDir bool) int {
+	count := 0
+	for _, entry := range entries {
+		if entry.IsDir == isDir && strings.EqualFold(path.Base(entry.Path), name) {
+			count++
+		}
+	}
+	return count
+}
+
+func verificationError(err error) error {
+	return fmt.Errorf("%w: %v", ErrVerification, err)
+}
+
+func docLibrary(docID string) string {
+	trimmed := strings.TrimPrefix(docID, "gns://")
+	if i := strings.IndexByte(trimmed, '/'); i > 0 {
+		return trimmed[:i]
+	}
+	return ""
+}
+
+func remoteParent(remotePath string) string {
+	parent, _ := dirAndName(remotePath)
+	return parent
+}
+
+// ---------------------------------------------------------------------------
+// Rename
+// ---------------------------------------------------------------------------
+
+type renameRequest struct {
+	DocID string `json:"docid"`
+	Name  string `json:"name"`
+	OnDup int    `json:"ondup,omitempty"`
+}
+
+func (p *Provider) Rename(ctx context.Context, oldPath, newPath string) error {
+	docID, err := p.resolvePath(ctx, oldPath)
+	if err != nil {
+		return fmt.Errorf("huadian Rename(%q): %w", oldPath, err)
+	}
+	_, newName := dirAndName(newPath)
+	if newName == "" {
+		return fmt.Errorf("huadian Rename: invalid new path %q", newPath)
+	}
+	if err := p.RenameByDocID(ctx, docID, newName); err != nil {
+		return err
+	}
+	// Invalidate old path subtree and new path's parent.
+	p.invalidateCache(oldPath)
+	p.invalidateCache(dirAndNameStr(newPath))
+	return nil
+}
+
+func dirAndNameStr(pth string) string {
+	d, _ := dirAndName(pth)
+	return d
+}
+
+// RenameByDocID renames a file by docid.
+func (p *Provider) RenameByDocID(ctx context.Context, docID, newName string) error {
+	return p.post(ctx, "/api/efast/v1/file/rename", renameRequest{
+		DocID: docID,
+		Name:  newName,
+	}, nil)
+}
+
+// ---------------------------------------------------------------------------
+// Remove
+// ---------------------------------------------------------------------------
+
+type deleteRequest struct {
+	DocID string `json:"docid"`
+}
+
+func (p *Provider) Remove(ctx context.Context, remotePath string) error {
+	docID, err := p.resolvePath(ctx, remotePath)
+	if err != nil {
+		return fmt.Errorf("huadian Remove(%q): %w", remotePath, err)
+	}
+	if err := p.RemoveByDocID(ctx, docID); err != nil {
+		return err
+	}
+	// Invalidate removed path + subtree + parent.
+	p.invalidateCache(remotePath)
+	p.invalidateCache(dirAndNameStr(remotePath))
+	return nil
+}
+
+// RemoveByDocID deletes a file or directory by docid.
+func (p *Provider) RemoveByDocID(ctx context.Context, docID string) error {
+	return p.post(ctx, "/api/efast/v1/file/delete", deleteRequest{
+		DocID: docID,
+	}, nil)
+}
+
+var (
+	_ = strconv.Itoa
+	_ = time.Now
+)

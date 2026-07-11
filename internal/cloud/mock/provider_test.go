@@ -1,0 +1,499 @@
+package mock
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestNew_MustHaveRoot(t *testing.T) {
+	dir := t.TempDir()
+	prov := New(dir)
+	if prov.Root() != dir {
+		t.Fatalf("root = %q, want %q", prov.Root(), dir)
+	}
+	if prov.Name() != "mock" {
+		t.Fatalf("name = %q, want %q", prov.Name(), "mock")
+	}
+}
+
+func TestUploadDownload(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	data := []byte("hello world")
+	if err := prov.Upload(ctx, "/file.txt", bytes.NewReader(data)); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := prov.Download(ctx, "/file.txt", &buf); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	if !bytes.Equal(buf.Bytes(), data) {
+		t.Errorf("data = %q, want %q", buf.Bytes(), data)
+	}
+}
+
+func TestUploadOverwrite(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	prov.Upload(ctx, "/a.txt", bytes.NewReader([]byte("first")))
+	prov.Upload(ctx, "/a.txt", bytes.NewReader([]byte("second")))
+
+	var buf bytes.Buffer
+	prov.Download(ctx, "/a.txt", &buf)
+	if string(buf.Bytes()) != "second" {
+		t.Errorf("overwritten = %q, want %q", buf.Bytes(), "second")
+	}
+}
+
+func TestUploadNested(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	data := []byte("deep")
+	if err := prov.Upload(ctx, "/a/b/c/d.txt", bytes.NewReader(data)); err != nil {
+		t.Fatalf("upload nested: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := prov.Download(ctx, "/a/b/c/d.txt", &buf); err != nil {
+		t.Fatalf("download nested: %v", err)
+	}
+	if !bytes.Equal(buf.Bytes(), data) {
+		t.Errorf("nested data = %q, want %q", buf.Bytes(), data)
+	}
+
+	// Verify the local directory structure.
+	local := filepath.Join(prov.Root(), "a", "b", "c", "d.txt")
+	if _, err := os.Stat(local); err != nil {
+		t.Errorf("local file not found: %v", err)
+	}
+}
+
+func TestEmptyFile(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	if err := prov.Upload(ctx, "/empty.txt", bytes.NewReader(nil)); err != nil {
+		t.Fatalf("upload empty: %v", err)
+	}
+
+	info, err := prov.Stat(ctx, "/empty.txt")
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Size != 0 {
+		t.Errorf("size = %d, want 0", info.Size)
+	}
+	if info.IsDir {
+		t.Error("expected file, not dir")
+	}
+}
+
+func TestList(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	prov.Upload(ctx, "/dir/a.txt", bytes.NewReader([]byte("a")))
+	prov.Upload(ctx, "/dir/b.txt", bytes.NewReader([]byte("bb")))
+	prov.Upload(ctx, "/dir/sub/c.txt", bytes.NewReader([]byte("ccc")))
+
+	entries, err := prov.List(ctx, "/dir")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(entries) != 3 {
+		// a.txt, b.txt, sub
+		t.Fatalf("expected 3 entries, got %d", len(entries))
+	}
+
+	names := make(map[string]bool)
+	for _, e := range entries {
+		names[e.Path] = true
+	}
+	if !names["/dir/a.txt"] {
+		t.Error("missing /dir/a.txt")
+	}
+	if !names["/dir/b.txt"] {
+		t.Error("missing /dir/b.txt")
+	}
+	if !names["/dir/sub"] {
+		t.Error("missing /dir/sub")
+	}
+}
+
+func TestListEmpty(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	entries, err := prov.List(ctx, "/")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("expected 0 entries, got %d", len(entries))
+	}
+}
+
+func TestListNonexistent(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	entries, err := prov.List(ctx, "/no/such/path")
+	if err != nil {
+		t.Fatalf("list nonexistent: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("expected 0 entries, got %d", len(entries))
+	}
+}
+
+func TestStat(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	prov.Upload(ctx, "/data.txt", bytes.NewReader([]byte("hello")))
+
+	info, err := prov.Stat(ctx, "/data.txt")
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Size != 5 {
+		t.Errorf("size = %d, want 5", info.Size)
+	}
+	if info.Path != "/data.txt" {
+		t.Errorf("path = %q, want %q", info.Path, "/data.txt")
+	}
+	if info.IsDir {
+		t.Error("expected file, not dir")
+	}
+}
+
+func TestStatNotFound(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	_, err := prov.Stat(ctx, "/missing.txt")
+	if err == nil {
+		t.Error("expected error for missing file")
+	}
+}
+
+func TestMkdir(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	if err := prov.Mkdir(ctx, "/newdir"); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	info, err := prov.Stat(ctx, "/newdir")
+	if err != nil {
+		t.Fatalf("stat after mkdir: %v", err)
+	}
+	if !info.IsDir {
+		t.Error("expected directory")
+	}
+}
+
+func TestMkdirNested(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	if err := prov.Mkdir(ctx, "/a/b/c"); err != nil {
+		t.Fatalf("mkdir nested: %v", err)
+	}
+
+	info, err := prov.Stat(ctx, "/a/b/c")
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if !info.IsDir {
+		t.Error("expected directory")
+	}
+}
+
+func TestRemoveFile(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	prov.Upload(ctx, "/bye.txt", bytes.NewReader([]byte("x")))
+
+	if err := prov.Remove(ctx, "/bye.txt"); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	_, err := prov.Stat(ctx, "/bye.txt")
+	if err == nil {
+		t.Error("expected not-found after remove")
+	}
+}
+
+func TestRemoveNonEmptyDir(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	prov.Mkdir(ctx, "/dir")
+	prov.Upload(ctx, "/dir/a.txt", bytes.NewReader([]byte("x")))
+
+	err := prov.Remove(ctx, "/dir")
+	if err == nil {
+		t.Error("expected error removing non-empty dir")
+	}
+}
+
+func TestRemoveEmptyDir(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	prov.Mkdir(ctx, "/emptydir")
+
+	if err := prov.Remove(ctx, "/emptydir"); err != nil {
+		t.Fatalf("remove empty dir: %v", err)
+	}
+}
+
+func TestRemoveNotFound(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	err := prov.Remove(ctx, "/nonexistent")
+	if err == nil {
+		t.Error("expected error")
+	}
+}
+
+func TestRename(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	prov.Upload(ctx, "/old.txt", bytes.NewReader([]byte("data")))
+
+	if err := prov.Rename(ctx, "/old.txt", "/new.txt"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+
+	// Old gone.
+	_, err := prov.Stat(ctx, "/old.txt")
+	if err == nil {
+		t.Error("old path should not exist")
+	}
+
+	// New exists.
+	var buf bytes.Buffer
+	if err := prov.Download(ctx, "/new.txt", &buf); err != nil {
+		t.Fatalf("download after rename: %v", err)
+	}
+	if string(buf.Bytes()) != "data" {
+		t.Errorf("data = %q, want %q", buf.Bytes(), "data")
+	}
+}
+
+func TestRenameAcrossDirs(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	prov.Upload(ctx, "/src/doc.txt", bytes.NewReader([]byte("move me")))
+
+	if err := prov.Rename(ctx, "/src/doc.txt", "/dst/doc.txt"); err != nil {
+		t.Fatalf("rename across dirs: %v", err)
+	}
+
+	var buf bytes.Buffer
+	prov.Download(ctx, "/dst/doc.txt", &buf)
+	if string(buf.Bytes()) != "move me" {
+		t.Errorf("data = %q", buf.Bytes())
+	}
+}
+
+func TestRenameNotFound(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	err := prov.Rename(ctx, "/missing.txt", "/dest.txt")
+	if err == nil {
+		t.Error("expected error")
+	}
+}
+
+func TestChineseFilenames(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	files := []string{
+		"/中文文件.txt",
+		"/目录/文档.txt",
+		"/hello/你好世界.md",
+		"/数据/报表2024.csv",
+	}
+
+	for _, p := range files {
+		content := []byte("content for " + p)
+		if err := prov.Upload(ctx, p, bytes.NewReader(content)); err != nil {
+			t.Fatalf("upload %q: %v", p, err)
+		}
+
+		info, err := prov.Stat(ctx, p)
+		if err != nil {
+			t.Fatalf("stat %q: %v", p, err)
+		}
+		if info.Path != p {
+			t.Errorf("stat path = %q, want %q", info.Path, p)
+		}
+
+		var buf bytes.Buffer
+		if err := prov.Download(ctx, p, &buf); err != nil {
+			t.Fatalf("download %q: %v", p, err)
+		}
+		if !bytes.Equal(buf.Bytes(), content) {
+			t.Errorf("download mismatch for %q", p)
+		}
+	}
+
+	// List root and verify all files appear.
+	all, err := prov.List(ctx, "/")
+	if err != nil {
+		t.Fatalf("list root: %v", err)
+	}
+	seen := make(map[string]bool)
+	for _, e := range all {
+		seen[e.Path] = true
+	}
+	for _, p := range files {
+		// The first-level dirs/files
+		first := "/" + strings.Split(strings.TrimPrefix(p, "/"), "/")[0]
+		if !seen[first] {
+			t.Errorf("list missing %q", first)
+		}
+	}
+}
+
+func TestPathTraversalRejected(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	tests := []string{
+		"/../../../etc/passwd",
+		"/..\\..\\windows",
+		"/foo/../../bar",
+	}
+
+	for _, p := range tests {
+		err := prov.Upload(ctx, p, bytes.NewReader([]byte("x")))
+		if err == nil {
+			t.Errorf("expected error for traversal path %q", p)
+		}
+
+		err = prov.Download(ctx, p, io.Discard)
+		if err == nil {
+			t.Errorf("expected error for traversal path %q", p)
+		}
+
+		_, err = prov.Stat(ctx, p)
+		if err == nil {
+			t.Errorf("expected error for traversal path %q", p)
+		}
+	}
+}
+
+func TestPathSpacesAndCase(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	paths := []string{
+		"/my docs/file name.txt",
+		"/CamelCase/FileName.TXT",
+		"/a dir/with spaces/",
+	}
+
+	for _, p := range paths {
+		if strings.HasSuffix(p, "/") {
+			if err := prov.Mkdir(ctx, p); err != nil {
+				t.Fatalf("mkdir %q: %v", p, err)
+			}
+		} else {
+			if err := prov.Upload(ctx, p, bytes.NewReader([]byte(p))); err != nil {
+				t.Fatalf("upload %q: %v", p, err)
+			}
+		}
+	}
+
+	entries, err := prov.List(ctx, "/")
+	if err != nil {
+		t.Fatalf("list root: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Errorf("expected 3 entries, got %d: %v", len(entries), entries)
+	}
+}
+
+func TestDirInList(t *testing.T) {
+	ctx := context.Background()
+	prov := New(t.TempDir())
+
+	prov.Mkdir(ctx, "/mydir")
+	prov.Upload(ctx, "/mydir/a.txt", bytes.NewReader([]byte("a")))
+
+	entries, err := prov.List(ctx, "/")
+	if err != nil {
+		t.Fatalf("list root: %v", err)
+	}
+
+	found := false
+	for _, e := range entries {
+		if e.Path == "/mydir" {
+			found = true
+			if !e.IsDir {
+				t.Error("mydir should be a directory")
+			}
+		}
+	}
+	if !found {
+		t.Error("mydir not found in listing")
+	}
+}
+
+func TestLocalPath_RejectsEscape(t *testing.T) {
+	prov := New(t.TempDir())
+
+	badPaths := []string{
+		"../../../etc/passwd",
+		"C:\\Windows\\System32",
+		"..\\..\\config",
+	}
+	for _, p := range badPaths {
+		got, err := prov.localPath(p)
+		if err == nil {
+			t.Errorf("localPath(%q) = %q, want error", p, got)
+		}
+	}
+}
+
+func TestLocalPath_Valid(t *testing.T) {
+	prov := New(t.TempDir())
+
+	got, err := prov.localPath("dir/file.txt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expected := filepath.Join(prov.Root(), "dir", "file.txt")
+	if got != expected {
+		t.Errorf("localPath = %q, want %q", got, expected)
+	}
+}
+
+func TestResolveSymlinks_NoReparse(t *testing.T) {
+	prov := New(t.TempDir())
+	abs := filepath.Join(prov.Root(), "normal", "file.txt")
+	resolved := prov.resolveSymlinks(abs)
+	if resolved != abs {
+		t.Errorf("resolveSymlinks changed path: %q -> %q", abs, resolved)
+	}
+}
